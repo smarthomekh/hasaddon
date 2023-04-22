@@ -26,6 +26,6 @@
   "panel_icon": "mdi:docker",
   "slug": "portainer",
   "startup": "services",
-  "url": "https://github.com/MikeJMcGuire/hass-portainer",
+  "url": "https://github.com/smarthomecomkh/hasaddon/hass-portainer",
   "version": "2023.1.0"
 }
