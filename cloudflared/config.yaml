@@ -28,7 +28,7 @@ schema:
     service: str
     disableChunkedEncoding: bool?
   tunnel_name: 28b
-  tunnel_token: d4242b4d-b8dc-4376-a4d5-851820a20510
+  tunnel_token: str?
   post_quantum: bool?
   catch_all_service: str?
   nginx_proxy_manager: bool?
