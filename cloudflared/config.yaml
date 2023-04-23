@@ -7,7 +7,7 @@ url: https://github.com/smarthomecomkh/hasaddon/cloudflared/
 codenotary: dev@brenner.tech
 init: false
 hassio_api: true
-hassio_role: homeassistant
+hassio_role: 28b
 arch:
 - aarch64
 - amd64
