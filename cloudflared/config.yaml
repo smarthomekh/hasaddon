@@ -27,7 +27,7 @@ schema:
   - hostname: str
     service: str
     disableChunkedEncoding: bool?
-  tunnel_name: 28b
+  tunnel_name: str?
   tunnel_token: str?
   post_quantum: bool?
   catch_all_service: str?
