@@ -1,4 +1,4 @@
 ## What’s changed
-## 🚀 Enhancements
+## 🐛 Bug fixes
 
-- Remove uppercase chars from valid hostnames @brenner-tobias (#346)
+- Revert Cloudflared to 2023.4.1 @smarthome.com.kh (#389)
