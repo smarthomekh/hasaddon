@@ -1,4 +1,4 @@
 ## What’s changed
-## ⬆️ Dependency updates
+## 🚀 Enhancements
 
-- ⬆️ Update cloudflare/cloudflared to v2023.4.0 @renovate (#370)
+- Remove uppercase chars from valid hostnames @brenner-tobias (#346)
