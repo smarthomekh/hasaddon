@@ -1,9 +1,5 @@
 # Smart Home Cambodia | Modern life with automation
 
-![Project Stage][project-stage-shield]
-![Maintenance][maintenance-shield]
-[![License][license-shield]](LICENSE.md)
-
 ## About
 
 Home Assistant allows anyone to create add-on repositories to share their
