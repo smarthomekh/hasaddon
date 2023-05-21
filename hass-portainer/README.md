@@ -9,4 +9,4 @@ Port options are available for exposing ports 8000 and 9000 as required.
 
 Portainer requires Home Assistant protection mode to be disabled, as it requires administrative access to the docker platform. As a result, care must be taken when using the portainer tool.
 
-Home Assistant AddOn Repository: https://github.com/smarthomecomkh/hassaddon
+Home Assistant AddOn Repository: https://github.com/smarthomecomkh/hasaddon
