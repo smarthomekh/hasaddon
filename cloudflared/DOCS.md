@@ -10,8 +10,7 @@ connection.
 
 Please make sure you comply with the
 [Cloudflare Self-Serve Subscription Agreement][cloudflare-sssa] when using this
-add-on. For example [section 2.8][cloudflare-sssa-28] could be breached when
-streaming videos (e.g. Plex) or other non-HTML content.
+add-on.
 
 ## Initial setup
 
@@ -299,17 +298,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-[addon-installation]: https://github.com/brenner-tobias/addon-cloudflared#installation
-[addon-wiki]: https://github.com/brenner-tobias/addon-cloudflared/wiki
-[advancedconfiguration]: https://www.home-assistant.io/getting-started/configuration/
-[cloudflare-sssa]: https://www.cloudflare.com/en-gb/terms/
-[cloudflare-sssa-28]: https://www.cloudflare.com/en-gb/terms/#:~:text=2.8%20Limitation%20on%20Serving%20Non%2DHTML%20Content
-[how-tos]: https://github.com/brenner-tobias/addon-cloudflared/wiki/How-tos
-[nginx_proxy_manager]: https://github.com/hassio-addons/addon-nginx-proxy-manager
-[tobias]: https://github.com/brenner-tobias
-[troubleshooting]: https://github.com/brenner-tobias/addon-cloudflared/wiki/Troubleshooting
-[disablechunkedencoding]: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/configuration-file/ingress#disablechunkedencoding
-[create-remote-managed-tunnel]: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/tunnel-guide/#1-create-a-tunnel
-[addon-remote-tunnel]: https://github.com/brenner-tobias/addon-cloudflared/wiki/How-tos#how-to-configure-remote-tunnels
-[addon-remote-or-local]: https://github.com/brenner-tobias/addon-cloudflared/wiki/How-tos#local-vs-remote-managed-tunnels

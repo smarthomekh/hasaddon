@@ -17,11 +17,9 @@ connection.
 
 **To use this add-on, you have to own a domain name (e.g. example.com) that is
 using Cloudflare for its DNS entries. You can find more information about that
-in our [Wiki][wiki]**
+in our [Wiki][wiki]**.
 
 ## Disclaimer
 
 Please make sure to be compliant with the
 [Cloudflare Self-Serve Subscription Agreement][cloudflare-sssa] when using this
-add-on. Especially [section 2.8][cloudflare-sssa-28] could be breached when
-mainly streaming videos or other Non-HTML content.
