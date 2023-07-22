@@ -75,3 +75,7 @@ For the weekdays, as you can easily understand, only the first two chars are use
 Every schedule (or row, if you prefer) is a JSON file stored in the [share/simplescheduler] folder under the SAMBA share.
 This way the data can "survive" to an addon upgrade or reinstallation.
 You can easily backup and restore them in case of failure. In the same way, you can (accidentally?) delete them. So be aware of that.
+
+### Last but not least
+If you want to convince me to stay up at night to work on this, just <a target="_blank" href="https://www.paypal.com/donate/?hosted_button_id=8FN58C8SM9LLW">buy me a beer 🍺</a> \
+You may say that regular people needs coffee to do that. Well, I'm not a regular person.
