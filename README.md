@@ -14,5 +14,3 @@ Additional add-ons might follow in the future.
 Adding this add-ons repository to your Home Assistant instance is
 pretty straightforward. In the Home Assistant add-on store,
 a possibility to add a repository is provided.
-
-Use the following URL to add this repository:
