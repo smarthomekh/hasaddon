@@ -15,7 +15,7 @@ Simple OneDrive integration for seamless Home Assistant Backups to the cloud.
 - Supports Home Assistant Events
 - Includes Sensor Entities for Dashboards / Automations
 
-Full documentation available on project page at [GitHub](https://github.com/lavinir/hassio-onedrive-backup)
+Full documentation available on project page at [GitHub](https://github.com/smarthomekh/hassio-onedrive-backup)
 
 ## Support
 This is a free addon but if you enjoy this addon and would like to support the development it would be much appreciated :)
