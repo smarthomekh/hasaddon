@@ -19,5 +19,3 @@ Full documentation available on project page at [GitHub](https://github.com/lavi
 
 ## Support
 This is a free addon but if you enjoy this addon and would like to support the development it would be much appreciated :)
-
-[<img src ="https://raw.githubusercontent.com/lavinir/hassio-onedrive-backup/main/onedrive-backup/images/bmc.svg" width="150">](https://www.buymeacoffee.com/snirlavis)
