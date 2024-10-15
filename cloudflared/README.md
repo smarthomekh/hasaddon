@@ -3,6 +3,7 @@
 [![GitHub Release][releases-shield]][releases]
 ![Project Stage][project-stage-shield]
 ![Project Maintenance][maintenance-shield]
+![Reported Installations][installations-shield-stable]
 
 Connect remotely to your Home Assistant instance without opening any ports using
 Cloudflared.

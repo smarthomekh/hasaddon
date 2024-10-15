@@ -18,6 +18,8 @@ add-on.
 
 1. A domain name (e.g. example.com) using Cloudflare for DNS. If you don't have
    one see [Domain name and Cloudflare set up][how-tos].
+   Please be aware that domains from **Freenom** do not work anymore, so you
+   have to chose / migrate to another registrar.
 1. Decide between a local tunnel (managed by the add-on) or a remote tunnel
    (managed in Cloudflare's interface). [Learn more][addon-remote-or-local].
 1. This add-on should be [installed][addon-installation] but not started yet.
@@ -75,6 +77,8 @@ advanced config can be achieved using the remote tunnel setup.
 - [`tunnel_name`](#option-tunnel_name)
 - [`catch_all_service`](#option-catch_all_service)
 - [`nginx_proxy_manager`](#option-nginx_proxy_manager)
+- [`post_quantum`](#option-post_quantum)
+- [`run_parameters`](#option-run_parameters)
 - [`log_level`](#option-log_level)
 
 ### Overview: Add-on configuration
@@ -150,20 +154,6 @@ than the default of `homeassistant`.
 tunnel_name: myHomeAssistant
 ```
 
-### Option: `post_quantum`
-
-If you want Cloudflared to use post-quantum cryptography for the tunnel,
-set this flag.
-
-**Note**: _When `post_quantum` is set, cloudflared restricts itself to QUIC
-transport for the tunnel connection. This might lead to problems for some users.
-Also, it will only allow post-quantum hybrid key exchanges and not fall back to
-a non post-quantum connection._
-
-```yaml
-post_quantum: true
-```
-
 ### Option: `catch_all_service`
 
 If you want to forward all requests from any hostnames not defined in the
@@ -218,11 +208,65 @@ in Cloudflare by adding a CNAME record with `*` as name.
 Finally, you have to set-up your proxy hosts in Nginx Proxy Manager and forward
 them to wherever you like.
 
+### Option: `post_quantum`
+
+If you want Cloudflared to use post-quantum cryptography for the tunnel,
+set this flag.
+
+**Note**: _When `post_quantum` is set, cloudflared restricts itself to QUIC
+transport for the tunnel connection. This might lead to problems for some users.
+Also, it will only allow post-quantum hybrid key exchanges and not fall back to
+a non post-quantum connection._
+
+```yaml
+post_quantum: true
+```
+
+### Option: `run_parameters`
+
+You can add additional run parameters to the cloudflared demon using this
+parameter. Check the [Cloudflare documentation][cloudflare-run_parameter]
+for all available parameters and their explanation.
+
+Valid parameters to add are:
+
+- --​​edge-bind-address
+- --edge-ip-version
+- --grace-period
+- --logfile
+- --loglevel
+- --pidfile
+- --protocol
+- --region
+- --retries
+- --tag
+- --ha-connections
+
+**Note**: _These parameters are added to the by default present parameters
+"no-autoupdate", "metrics" and "loglevel". Additionally, for a locally managed
+tunnel "origincert" and "config" are added while "token" is added
+for remote managed tunnels. You cannot override these parameters with this
+option._
+
+**Note**: _If you are using an option that requires a path, you can use /config
+as root. This path can be accessed, for example, via the VS-code add-on via
+/addon_configs._
+
+```yaml
+run_parameters:
+  - "--region=us"
+  - "--protocol=http2"
+  - "--loglevel=debug"
+```
+
 ### Option: `log_level`
 
 The `log_level` option controls the level of log output by the addon and can
 be changed to be more or less verbose, which might be useful when you are
 dealing with an unknown issue.
+
+**Note**: _If you want to change the log level of the tunnel itself you can
+use the `run_parameters` `--loglevel` option._
 
 ```yaml
 log_level: debug
@@ -268,18 +312,21 @@ If you need assistance changing the config, please follow the
 
 ## Add-On Wiki
 
-For more advance [How-Tos][how-tos] and a [Troubleshooting Section](troubleshooting),
+For more advance [How-Tos][how-tos] and a [Troubleshooting Section][troubleshooting],
 please visit the [Add-On Wiki on GitHub][addon-wiki].
 
 ## Authors & contributors
 
 The original setup of this repository is by [Tobias Brenner][tobias].
 
+For a full list of all authors and contributors,
+check [the contributor's page][contributors].
+
 ## License
 
 MIT License
 
-Copyright (c) 2023 Tobias Brenner
+Copyright (c) 2024 Tobias Brenner
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
