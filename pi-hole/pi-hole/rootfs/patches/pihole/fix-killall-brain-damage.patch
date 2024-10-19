@@ -1,0 +1,13 @@
+diff --git a/pihole b/pihole
+index d2ff364..38e09d0 100755
+--- a/pihole
++++ b/pihole
+@@ -105,7 +105,7 @@ restartDNS() {
+   if [[ "${svcOption}" =~ "reload" ]]; then
+     # Reload has been requested
+     # Note: This will NOT re-read any *.conf files
+-    svc="killall -s SIGHUP ${resolver}"
++    svc="kill -s SIGHUP $(pgrep ${resolver})"
+   else
+     # A full restart has been requested
+     svc="service ${resolver} restart"
