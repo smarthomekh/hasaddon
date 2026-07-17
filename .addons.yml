@@ -5,3 +5,7 @@ addons:
     repository: brenner-tobias/addon-cloudflared
     target: cloudflared
     image: ghcr.io/brenner-tobias/cloudflared/{arch}
+  netbird:
+    repository: netbirdio/netbird
+    target: netbird
+    image: ghcr.io/netbirdio/netbird/{arch}
