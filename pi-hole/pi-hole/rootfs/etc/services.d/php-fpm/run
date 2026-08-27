@@ -1,9 +1,0 @@
-#!/usr/bin/with-contenv bashio
-# ==============================================================================
-# Home Assistant Community Add-on: Pi-hole
-# Runs the PHP-FPM daemon
-# ==============================================================================
-
-bashio::log.info "Starting PHP-FPM..."
-export PHP_ERROR_LOG=/dev/stderr
-exec php-fpm7 --nodaemonize
