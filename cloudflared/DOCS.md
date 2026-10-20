@@ -1,4 +1,4 @@
-# Home Assistant Add-on: Cloudflared
+# Home Assistant App : Cloudflared
 
 Cloudflared connects your Home Assistant Instance via a secure tunnel to a domain
 or subdomain at Cloudflare. This allows you to expose your Home Assistant
@@ -10,7 +10,7 @@ connection.
 
 Please make sure you comply with the
 [Cloudflare Self-Serve Subscription Agreement][cloudflare-sssa] when using this
-add-on.
+app.
 
 ## Initial setup
 
@@ -20,51 +20,53 @@ add-on.
    one see [Domain name and Cloudflare set up][how-tos].
    Please be aware that domains from **Freenom** do not work anymore, so you
    have to chose / migrate to another registrar.
-1. Decide between a local tunnel (managed by the add-on) or a remote tunnel
-   (managed in Cloudflare's interface). [Learn more][addon-remote-or-local].
-1. This add-on should be [installed][addon-installation] but not started yet.
+1. If you have not done already, [activate Websockets in Cloudflare for your
+   domain][cloudflare-websockets].
+1. Decide between a local tunnel (managed by the app or a remote tunnel
+   (managed in Cloudflare's interface). [Learn more][app-remote-or-local].
+1. This app should be [installed][app-installation] but not started yet.
 
 After completing the prerequisites, proceed below based on the type of tunnel you
 chose.
 
-### Local tunnel add-on setup (recommended)
+### Local tunnel app setup (recommended)
 
 In the following steps a Cloudflare Tunnel will be automatically created by the
-add-on to expose your Home Assistant instance.
+app to expose your Home Assistant instance.
 
 If you only want to expose other services, you can leave `external_hostname`
 empty and set `additional_hosts` as [described below](#configuration).
 
-1. Configure the `http` integration in your Home Assistant config as
-   [described below](#configurationyaml)
-1. Set `external_hostname` add-on option to the domain/subdomain
+1. Configure the `HTTP server` in your in your Home Assistant settings as
+   [described below](#http-server)
+1. Set `external_hostname` app option to the domain/subdomain
    you want to use for remote access e.g. `ha.example.com`
-1. Start the add-on (this will overwrite any existing DNS entries matching
+1. Start the app (this will overwrite any existing DNS entries matching
    `external_hostname` or `additional_hosts`)
-1. Paste the URL from the add-on logs in a new tab to authenticate with Cloudflare
+1. Paste the URL from the app logs in a new tab to authenticate with Cloudflare
 1. Access your Home Assistant via the remote URL without port e.g.
    `https://ha.example.com/`
 
 A tunnel should now be listed in your Cloudflare Teams dashboard.
 Please review the additional configuration options below.
 
-### Remote tunnel add-on setup (advanced)
+### Remote tunnel app setup (advanced)
 
 In the following steps you will manually create a Cloudflare Tunnel in the Zero
-Trust Dashboard and provide the token to the add-on.
+Trust Dashboard and provide the token to the app.
 
 1. Configure the `http` integration in to your Home Assistant config as
    [described below](#configurationyaml)
 1. Create a Cloudflare Tunnel in the Cloudflare Teams dashboard following
-   [this how-to][addon-remote-tunnel]
-1. Set `tunnel_token` add-on option to your [tunnel token][create-remote-managed-tunnel]
+   [this how-to][app-remote-tunnel]
+1. Set `tunnel_token` app option to your [tunnel token][create-remote-managed-tunnel]
    (all other configuration will be ignored)
-1. Start the add-on, check the logs to confirm everything went as
+1. Start the app, check the logs to confirm everything went as
    expected
 1. Access your Home Assistant via the remote URL without port e.g.
    `https://ha.example.com/`
 
-Your tunnel should now be associated with the Cloudflared add-on. Any
+Your tunnel should now be associated with the Cloudflared app. Any
 configuration changes should be made in the Cloudflare Teams dashboard.
 
 ## Configuration
@@ -81,11 +83,11 @@ advanced config can be achieved using the remote tunnel setup.
 - [`run_parameters`](#option-run_parameters)
 - [`log_level`](#option-log_level)
 
-### Overview: Add-on configuration
+### Overview: App configuration
 
-**Note**: _Remember to restart the add-on when the configuration is changed._
+**Note**: _Remember to restart the app when the configuration is changed._
 
-Example add-on configuration:
+Example app configuration:
 
 ```yaml
 external_hostname: ha.example.com
@@ -105,8 +107,6 @@ to use to access Home Assistant on.
 
 This is optional, `additional_hosts` can be used instead to only expose other
 services.
-
-**Note**: _The tunnel name needs to be unique in your Cloudflare account._
 
 ```yaml
 external_hostname: ha.example.com
@@ -139,9 +139,16 @@ additional_hosts:
     disableChunkedEncoding: true
 ```
 
-**Note**: _If you delete a hostname from the list, it will not be served
+**Note 1**: _If you delete a hostname from the list, it will not be served
 anymore. Nevertheless, you should also manually delete the DNS entry from
-Cloudflare since it can not be deleted by the add-on._
+Cloudflare since it can not be deleted by the app._
+
+**Note 2**: _If you want to fully delete the additional_hosts option,
+you have to add an empty array in the configuration as follows:._
+
+```yaml
+additional_hosts: []
+```
 
 ### Option: `tunnel_name`
 
@@ -160,7 +167,7 @@ If you want to forward all requests from any hostnames not defined in the
 `external_hostname` or the `additional_hosts`, you can use this option and
 define a URL to forward to. For example, this can be used for reverse proxies.
 
-**Note**: _If you want to use the HA add-on [Nginx Proxy Manager][nginx_proxy_manager]
+**Note**: _If you want to use the HA app [Nginx Proxy Manager][nginx_proxy_manager]
 as reverse proxy, you should set the flag `nginx_proxy_manager` ([see
 below](#option-nginx_proxy_manager)) and not use this option._
 
@@ -182,7 +189,7 @@ in Cloudflare by adding a CNAME record with `*` as name.
 
 ### Option: `nginx_proxy_manager`
 
-If you want to use Cloudflare Tunnel with the add-on
+If you want to use Cloudflare Tunnel with the app
 [Nginx Proxy Manager][nginx_proxy_manager], you can do so by setting this option.
 It will automatically set the catch_all_service to the internal URL of Nginx Proxy
 Manager. You do not have to add the option `catch_all_service` to your config (if
@@ -224,7 +231,7 @@ post_quantum: true
 
 ### Option: `run_parameters`
 
-You can add additional run parameters to the cloudflared demon using this
+You can add additional run parameters to the cloudflared daemon using this
 parameter. Check the [Cloudflare documentation][cloudflare-run_parameter]
 for all available parameters and their explanation.
 
@@ -249,8 +256,8 @@ for remote managed tunnels. You cannot override these parameters with this
 option._
 
 **Note**: _If you are using an option that requires a path, you can use /config
-as root. This path can be accessed, for example, via the VS-code add-on via
-/addon_configs._
+as root. This path can be accessed, for example, via the VS-code app via
+/app_configs._
 
 ```yaml
 run_parameters:
@@ -261,7 +268,7 @@ run_parameters:
 
 ### Option: `log_level`
 
-The `log_level` option controls the level of log output by the addon and can
+The `log_level` option controls the level of log output by the app and can
 be changed to be more or less verbose, which might be useful when you are
 dealing with an unknown issue.
 
@@ -279,7 +286,7 @@ Possible values are:
 - `info`: Normal (usually) interesting events.
 - `warning`: Exceptional occurrences that are not errors.
 - `error`: Runtime errors that do not require immediate action.
-- `fatal`: Something went terribly wrong. Add-on becomes unusable.
+- `fatal`: Something went terribly wrong. App becomes unusable.
 
 Please note that each level automatically includes log messages from a
 more severe level, e.g., `debug` also shows `info` messages. By default,
@@ -288,32 +295,30 @@ you are troubleshooting.
 
 ## Home Assistant configuration
 
-### configuration.yaml
+### HTTP server
 
 Since Home Assistant blocks requests from proxies/reverse proxies, you need to
-tell your instance to allow requests from the Cloudflared add-on. The add-on runs
-locally, so HA has to trust the docker network. In order to do so, add the
-following lines to your `/config/configuration.yaml`:
+tell your instance to allow requests from the Cloudflared app.
+The app runs locally, so HA has to trust the docker network.
+In order to do so, add the following in the `HTTP server` section under
+`Settings - System - Network`:
 
-**Note**: _There is no need to adapt anything in these lines since the IP range
-of the docker network is always the same._
+**Note**: _There is usually no need to adapt anything in these lines since the IP
+range of the docker network is always the same._
 
-```yaml
-http:
-  use_x_forwarded_for: true
-  trusted_proxies:
-    - 172.30.33.0/24
-```
+- `Reverse proxy - Trust X-Forwarded-For`: true
+- `Reverse proxy - Add trusted proxies`: 172.30.33.0/24
 
-Remember to restart Home Assistant when the configuration is changed.
+**If you are using non-standard hosting methods of HA (e.g. Proxmox), you
+might have to add another IP(range) here. Check your HA logs
+after attempting to connect to find the correct IP.**
 
-If you need assistance changing the config, please follow the
-[Advanced Configuration Tutorial][advancedconfiguration].
+Remember to restart Home Assistant after those changes.
 
-## Add-On Wiki
+## App Wiki
 
 For more advance [How-Tos][how-tos] and a [Troubleshooting Section][troubleshooting],
-please visit the [Add-On Wiki on GitHub][addon-wiki].
+please visit the [App Wiki on GitHub][app-wiki].
 
 ## Authors & contributors
 
@@ -326,7 +331,7 @@ check [the contributor's page][contributors].
 
 MIT License
 
-Copyright (c) 2024 Tobias Brenner
+Copyright (c) 2026 [homeassistant-apps][github-org]
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -345,3 +350,23 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+[app-installation]: https://github.com/homeassistant-apps/app-cloudflared#installation
+[app-remote-tunnel]: https://github.com/homeassistant-apps/app-cloudflared/wiki/How-tos#how-to-configure-remote-tunnels
+[app-remote-or-local]: https://github.com/homeassistant-apps/app-cloudflared/wiki/How-tos#local-vs-remote-managed-tunnels
+[app-wiki]: https://github.com/homeassistant-apps/app-cloudflared/wiki
+[advancedconfiguration]: https://www.home-assistant.io/getting-started/configuration/
+[http-integration]: https://www.home-assistant.io/getting-started/configuration/
+[homeassistant-config-splitting]: https://www.home-assistant.io/docs/configuration/splitting_configuration/
+[homeassistant-config-packages]: https://www.home-assistant.io/docs/configuration/packages/
+[cloudflare-sssa]: https://www.cloudflare.com/en-gb/terms/
+[cloudflare-run_parameter]: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/configure-tunnels/tunnel-run-parameters/
+[cloudflare-websockets]: https://developers.cloudflare.com/network/websockets/
+[contributors]: https://github.com/homeassistant-apps/app-cloudflared/graphs/contributors
+[how-tos]: https://github.com/homeassistant-apps/app-cloudflared/wiki/How-tos
+[nginx_proxy_manager]: https://github.com/hassio-addons/addon-nginx-proxy-manager
+[tobias]: https://github.com/homeassistant-apps
+[troubleshooting]: https://github.com/homeassistant-apps/app-cloudflared/wiki/Troubleshooting
+[disablechunkedencoding]: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/configuration-file/ingress#disablechunkedencoding
+[create-remote-managed-tunnel]: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/tunnel-guide/#1-create-a-tunnel
+[github-org]: https://github.com/homeassistant-apps
