@@ -1,12 +1,18 @@
-ARG BUILD_FROM=node:20-alpine
+ARG BUILD_FROM=ghcr.io/home-assistant/base:latest
 FROM ${BUILD_FROM}
 
-ENV LANG C.UTF-8
-ENV PORT 3000
-ENV NODE_ENV production
+# Set environment
+ENV LANG=C.UTF-8 \
+    PORT=3000 \
+    NODE_ENV=production
 
-# Install essential runtime tools
-RUN apk add --no-cache bash curl jq
+# Install Node.js, npm, bash, curl, and jq
+RUN apk add --no-cache \
+    nodejs \
+    npm \
+    bash \
+    curl \
+    jq
 
 WORKDIR /app
 
@@ -20,7 +26,7 @@ COPY . .
 # Build client production Vite bundle
 RUN npm run build
 
-# Copy and setup startup script
+# Make startup script executable
 COPY run.sh /run.sh
 RUN chmod +x /run.sh
 
