@@ -7,12 +7,12 @@ Directly monitor and govern your MikroTik router inside Home Assistant:
 - **Simple Queues**: Set bandwidth caps per client or IP pool.
 - **Firewall Controls**: 1-click device internet cutoff via address-list and filter rules.
 - **Real-Time Throughput**: Live chart and gauges of WAN & LAN throughput.
-- **RouterOS v7 Support**: Works with standard RouterOS REST API and API socket.
+- **RouterOS v7 Support**: Works with standard RouterOS REST API on port 8443 (HTTPS) or 8282 (HTTP).
 
 ## Installation in Home Assistant
 1. In Home Assistant, navigate to **Settings > Add-ons > Add-on Store**.
 2. Click the three dots in top-right corner > **Repositories**.
-3. Add this custom add-on folder or extract the downloaded zip into your Home Assistant `/addons/mikrotik_manager` folder.
-4. Click **Install**.
+3. Add custom repository: `https://github.com/smarthomecomkh/hasaddon`
+4. Find **MikroTik Manager** and click **Install**.
 5. Set your Router IP, Username, and Password in the **Configuration** tab.
 6. Click **Start** and select **Show in sidebar**!

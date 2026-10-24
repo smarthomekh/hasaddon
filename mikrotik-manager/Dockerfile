@@ -1,23 +1,29 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-nodejs:20
+ARG BUILD_FROM=node:20-alpine
 FROM ${BUILD_FROM}
 
 ENV LANG C.UTF-8
+ENV PORT 3000
+ENV NODE_ENV production
+
+# Install essential runtime tools
+RUN apk add --no-cache bash curl jq
 
 WORKDIR /app
 
-# Copy dependency manifests and install production dependencies
+# Copy dependency manifests and install dependencies
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm install
 
-# Copy compiled production bundle and server code
-COPY dist ./dist
-COPY server.ts ./
-COPY server ./server
-COPY src/types ./src/types
-COPY src/data ./src/data
+# Copy application source code
+COPY . .
 
-# Copy startup script
-COPY rootfs /
-RUN chmod a+x /etc/services.d/mikrotik/run
+# Build client production Vite bundle
+RUN npm run build
+
+# Copy and setup startup script
+COPY run.sh /run.sh
+RUN chmod +x /run.sh
 
 EXPOSE 3000
+
+CMD [ "/run.sh" ]
