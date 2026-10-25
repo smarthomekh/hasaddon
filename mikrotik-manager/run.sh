@@ -14,7 +14,7 @@ if [ -f "$CONFIG_PATH" ]; then
     export USE_SSL=$(jq --raw-output '.use_ssl // true' "$CONFIG_PATH")
     export ALLOW_INSECURE_CERT=$(jq --raw-output '.allow_insecure_cert // true' "$CONFIG_PATH")
     export DEMO_MODE=$(jq --raw-output '.demo_mode // false' "$CONFIG_PATH")
-    echo "[MikroTik Manager] Target router: ${ROUTER_HOST}:${ROUTER_PORT} (User: ${ROUTER_USER}, SSL: ${USE_SSL})"
+    echo "[MikroTik Manager] Configured router: ${ROUTER_HOST}:${ROUTER_PORT} (User: ${ROUTER_USER}, SSL: ${USE_SSL})"
 else
     echo "[MikroTik Manager] No /data/options.json found, using defaults or env variables."
 fi
@@ -23,4 +23,4 @@ export PORT=3000
 export NODE_ENV=production
 
 cd /app
-exec npx tsx server.ts
+exec node dist/server.js
