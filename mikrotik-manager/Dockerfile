@@ -1,37 +1,18 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/base:latest
-FROM ${BUILD_FROM}
-
-ENV LANG=C.UTF-8 \
-    PORT=3000
-
-# Install Node.js, npm, bash, curl, and jq
-RUN apk add --no-cache \
-    nodejs \
-    npm \
-    bash \
-    curl \
-    jq
-
+FROM node:22-alpine AS build
 WORKDIR /app
-
-# Copy dependency manifests
 COPY package*.json ./
-
-# Install dependencies (ensure build tools are installed)
-RUN npm install --unsafe-perm
-
-# Copy application source code
+RUN npm install --no-audit --no-fund
 COPY . .
+RUN npm run build && npm prune --omit=dev
 
-# Build client production bundle and bundled server.js
-RUN npm run build
-
-# Make startup script executable
+FROM node:22-alpine
+RUN apk add --no-cache bash jq
+WORKDIR /app
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/package.json ./package.json
 COPY run.sh /run.sh
-RUN chmod +x /run.sh
-
-ENV NODE_ENV=production
-
+RUN sed -i 's/\r$//' /run.sh && chmod a+x /run.sh
+ENV NODE_ENV=production PORT=3000
 EXPOSE 3000
-
-CMD [ "/run.sh" ]
+CMD ["/run.sh"]

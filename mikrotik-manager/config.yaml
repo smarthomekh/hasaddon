@@ -24,10 +24,10 @@ options:
   demo_mode: false
 schema:
   router_host: "str"
-  router_port: "int"
+  router_port: "port"
   router_user: "str"
   router_password: "password"
   use_ssl: "bool"
   allow_insecure_cert: "bool"
-  poll_interval: "int?"
+  poll_interval: "int(500,60000)?"
   demo_mode: "bool?"
