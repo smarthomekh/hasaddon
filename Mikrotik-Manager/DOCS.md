@@ -1,7 +1,7 @@
 # MikroTik Manager
 <p align="center">
   <img
-    src="https://raw.githubusercontent.com/smarthomekh/hasaddon/Mikrotik-Manager/main/banner.png"
+    src="https://raw.githubusercontent.com/smarthomekh/hasaddon/main/Mikrotik-Manager/logo.png"
     alt="MikroTik Manager Logo" width="180"
   />
 </p>
