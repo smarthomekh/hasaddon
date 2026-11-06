@@ -1,26 +1,35 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 set -e
 
-echo "[MikroTik Manager] Starting Home Assistant Ingress Add-on..."
+echo "[MikroTik Manager] Starting MikroTik Gateway Manager v1.4.16 (Home Assistant & CasaOS)..."
 
 CONFIG_PATH=/data/options.json
 
 if [ -f "$CONFIG_PATH" ]; then
-    echo "[MikroTik Manager] Reading options from $CONFIG_PATH..."
-    export ROUTER_HOST=$(jq --raw-output '.router_host // "192.168.99.1"' "$CONFIG_PATH")
-    export ROUTER_PORT=$(jq --raw-output '.router_port // 8443' "$CONFIG_PATH")
-    export ROUTER_USER=$(jq --raw-output '.router_user // "admin"' "$CONFIG_PATH")
-    export ROUTER_PASSWORD=$(jq --raw-output '.router_password // ""' "$CONFIG_PATH")
-    export USE_SSL=$(jq --raw-output '.use_ssl // true' "$CONFIG_PATH")
-    export ALLOW_INSECURE_CERT=$(jq --raw-output '.allow_insecure_cert // true' "$CONFIG_PATH")
-    export DEMO_MODE=$(jq --raw-output '.demo_mode // false' "$CONFIG_PATH")
-    echo "[MikroTik Manager] Configured router: ${ROUTER_HOST}:${ROUTER_PORT} (User: ${ROUTER_USER}, SSL: ${USE_SSL})"
+    echo "[MikroTik Manager] Home Assistant options.json detected at $CONFIG_PATH."
 else
-    echo "[MikroTik Manager] No /data/options.json found, using defaults or env variables."
+    echo "[MikroTik Manager] Running in standalone / CasaOS mode."
 fi
 
-export PORT=3000
+export PORT="${PORT:-3000}"
 export NODE_ENV=production
 
 cd /app
-exec node dist/server.js
+
+if [ -f "dist/server.js" ]; then
+    echo "[MikroTik Manager] Launching pre-built production server on port ${PORT}..."
+    exec node dist/server.js
+elif [ -f "server.js" ]; then
+    echo "[MikroTik Manager] Launching server.js on port ${PORT}..."
+    exec node server.js
+elif [ -f "server.ts" ]; then
+    echo "[MikroTik Manager] Attempting to run server.ts with tsx on port ${PORT}..."
+    exec npx tsx server.ts
+else
+    echo "================================================================================"
+    echo "[MikroTik Manager] CRITICAL ERROR: No executable entrypoint found in /app!"
+    echo "Expected 'dist/server.js' or 'server.ts'."
+    echo "Please ensure your repository includes the compiled 'dist/' directory."
+    echo "================================================================================"
+    exit 1
+fi

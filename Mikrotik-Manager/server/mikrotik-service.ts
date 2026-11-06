@@ -1,0 +1,3501 @@
+import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import fs from 'node:fs';
+import path from 'node:path';
+import { POPULAR_GAMES, POPULAR_WEBSITES } from '../src/data/blocklist-catalog.ts';
+import type {
+  AddressListEntry,
+  ClientDevice,
+  DayOfWeek,
+  FirewallFilterRule,
+  InterfaceTraffic,
+  NatRule,
+  RestrictionTimeSlot,
+  RouterConnectionConfig,
+  RouterInfo,
+  RouterSchedule,
+  SimpleQueue,
+  ThroughputHistoryPoint,
+} from '../src/types/mikrotik.ts';
+
+// HTTPS agent allowing self-signed MikroTik certificates
+const insecureHttpsAgent = new https.Agent({
+  rejectUnauthorized: false,
+  keepAlive: true,
+});
+
+const defaultHttpAgent = new http.Agent({
+  keepAlive: true,
+});
+
+interface RouterHttpResponse {
+  status: number;
+  statusText: string;
+  data: any;
+  raw: string;
+}
+
+function isPrivateLanIp(host: string): boolean {
+  if (!host) return false;
+  const clean = host.trim().toLowerCase();
+  if (clean === 'localhost' || clean.startsWith('127.')) return true;
+  if (clean.startsWith('192.168.')) return true;
+  if (clean.startsWith('10.')) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(clean)) return true;
+  return false;
+}
+
+function probePort(host: string, port: number, timeoutMs = 2500): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!host || isNaN(port) || port <= 0) {
+      return resolve(false);
+    }
+    const socket = new net.Socket();
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once('timeout', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.once('error', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.connect(port, host);
+  });
+}
+
+function sanitizeHost(rawHost: string): { host: string; port?: number; ssl?: boolean } {
+  if (!rawHost) return { host: '' };
+  let clean = rawHost.trim();
+  let ssl: boolean | undefined = undefined;
+  if (clean.startsWith('https://')) {
+    clean = clean.replace('https://', '');
+    ssl = true;
+  } else if (clean.startsWith('http://')) {
+    clean = clean.replace('http://', '');
+    ssl = false;
+  }
+  clean = clean.replace(/\/.*$/, '');
+  let port: number | undefined = undefined;
+  if (clean.includes(':')) {
+    const parts = clean.split(':');
+    clean = parts[0];
+    const p = parseInt(parts[1], 10);
+    if (!isNaN(p) && p > 0) port = p;
+  }
+  return { host: clean, port, ssl };
+}
+
+function doRouterRequest(
+  config: { host: string; port: number; use_ssl: boolean; allow_insecure_cert: boolean; username: string; password?: string },
+  endpoint: string,
+  options: { method?: string; body?: any; timeoutMs?: number } = {}
+): Promise<RouterHttpResponse> {
+  return new Promise((resolve, reject) => {
+    const sanitized = sanitizeHost(config.host);
+    const targetHost = sanitized.host;
+    const targetPort = sanitized.port || config.port || (config.use_ssl ? 8443 : 80);
+    const isHttps = sanitized.ssl !== undefined ? sanitized.ssl : Boolean(config.use_ssl);
+
+    if (!targetHost) {
+      return reject(new Error('Router host address is missing'));
+    }
+
+    const client = isHttps ? https : http;
+    const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+    const restPath = cleanEndpoint.startsWith('/rest') ? cleanEndpoint : `/rest${cleanEndpoint}`;
+    const auth = Buffer.from(`${config.username || 'admin'}:${config.password || ''}`).toString('base64');
+    const bodyStr = options.body ? JSON.stringify(options.body) : null;
+
+    const reqOptions: https.RequestOptions = {
+      hostname: targetHost,
+      port: targetPort,
+      path: restPath,
+      method: (options.method || 'GET').toUpperCase(),
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(bodyStr ? { 'Content-Length': Buffer.byteLength(bodyStr) } : {}),
+      },
+      agent: isHttps ? insecureHttpsAgent : defaultHttpAgent,
+      timeout: options.timeoutMs || 5000,
+    };
+
+    if (isHttps && config.allow_insecure_cert) {
+      reqOptions.rejectUnauthorized = false;
+    }
+
+    const req = client.request(reqOptions, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      res.on('end', () => {
+        let parsed: any = null;
+        try {
+          parsed = JSON.parse(data);
+        } catch {
+          parsed = data;
+        }
+        resolve({
+          status: res.statusCode || 200,
+          statusText: res.statusMessage || '',
+          data: parsed,
+          raw: data,
+        });
+      });
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error(`Connection timed out after ${options.timeoutMs || 5000}ms to ${targetHost}:${targetPort}`));
+    });
+
+    req.on('error', (err) => {
+      reject(err);
+    });
+
+    if (bodyStr) {
+      req.write(bodyStr);
+    }
+    req.end();
+  });
+}
+
+/** True when a RouterOS queue `target` (comma separated list) addresses exactly this host IP. */
+function targetMatchesIp(target: string | undefined, ip: string): boolean {
+  if (!target || !ip) return false;
+  return String(target)
+    .split(',')
+    .map((t) => t.trim())
+    .some((t) => t === ip || t === `${ip}/32`);
+}
+
+const isTrue = (v: any): boolean => v === true || v === 'true' || v === 'yes';
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const idOf = (o: any): string | undefined => (o && (o['.id'] || o.id)) || undefined;
+const errMsg = (e: any): string => (e && e.message) || String(e);
+
+/** RouterOS answers "failure: already have such entry" when an idempotent add is repeated. */
+const isAlreadyExistsError = (e: any): boolean => /already have|already exists|already in/i.test(errMsg(e));
+
+class MikroTikService {
+  private config: RouterConnectionConfig = {
+    host: '192.168.88.1',
+    port: 80,
+    username: 'admin',
+    password: '',
+    use_ssl: false,
+    allow_insecure_cert: true,
+    poll_interval_ms: 1000,
+    mode: 'real',
+    connected: false,
+    last_sync: new Date().toISOString(),
+  };
+
+  private panicKillswitchActive = false;
+
+  private routerInfo: RouterInfo = {
+    identity: 'MikroTik-RB5009',
+    model: 'RB5009UG+S+IN',
+    routeros_version: 'v7.16.1 (stable)',
+    architecture: 'arm64',
+    cpu: 'Marvell Armada 7040 4-Core',
+    cpu_count: 4,
+    cpu_frequency_mhz: 1400,
+    cpu_load_percent: 18,
+    free_memory_mb: 842,
+    total_memory_mb: 1024,
+    free_hdd_mb: 486,
+    total_hdd_mb: 512,
+    uptime: '18d 04:32:15',
+    uptime_seconds: 1571535,
+    temperature_celsius: 42,
+    voltage_volts: 24.2,
+    board_name: 'RB5009UG+S+',
+    serial_number: 'HE908D5B147',
+  };
+
+  private interfaces: InterfaceTraffic[] = [
+    {
+      id: '*1',
+      name: 'ether1-WAN',
+      type: 'ethernet',
+      mac_address: 'DC:2C:6E:9A:01:F1',
+      running: true,
+      disabled: false,
+      rx_bps: 42_500_000,
+      tx_bps: 14_800_000,
+      rx_packets_per_sec: 4200,
+      tx_packets_per_sec: 2150,
+      total_rx_bytes: 489_240_100_000,
+      total_tx_bytes: 142_890_400_000,
+      comment: 'Primary ISP Fiber Uplink (1 Gbps)',
+      is_wan: true,
+    },
+    {
+      id: '*2',
+      name: 'ether2-LAN-Core',
+      type: 'ethernet',
+      mac_address: 'DC:2C:6E:9A:01:F2',
+      running: true,
+      disabled: false,
+      rx_bps: 14_100_000,
+      tx_bps: 38_200_000,
+      rx_packets_per_sec: 1980,
+      tx_packets_per_sec: 3950,
+      total_rx_bytes: 139_120_000_000,
+      total_tx_bytes: 452_800_000_000,
+      comment: '2.5G Trunk to Core Switch',
+      is_wan: false,
+    },
+    {
+      id: '*3',
+      name: 'ether3-HomeAssistant',
+      type: 'ethernet',
+      mac_address: 'DC:2C:6E:9A:01:F3',
+      running: true,
+      disabled: false,
+      rx_bps: 1_250_000,
+      tx_bps: 2_890_000,
+      rx_packets_per_sec: 240,
+      tx_packets_per_sec: 310,
+      total_rx_bytes: 32_100_000_000,
+      total_tx_bytes: 41_200_000_000,
+      comment: 'Dedicated HA Green Server',
+      is_wan: false,
+    },
+    {
+      id: '*4',
+      name: 'wlan1-Home-5GHz',
+      type: 'wireless',
+      mac_address: 'DC:2C:6E:9A:01:F4',
+      running: true,
+      disabled: false,
+      rx_bps: 18_400_000,
+      tx_bps: 24_600_000,
+      rx_packets_per_sec: 2100,
+      tx_packets_per_sec: 2650,
+      total_rx_bytes: 204_000_000_000,
+      total_tx_bytes: 290_500_000_000,
+      comment: 'CAPsMAN High-Speed Wi-Fi 6',
+      is_wan: false,
+    },
+    {
+      id: '*5',
+      name: 'wlan2-IoT-2.4GHz',
+      type: 'wireless',
+      mac_address: 'DC:2C:6E:9A:01:F5',
+      running: true,
+      disabled: false,
+      rx_bps: 820_000,
+      tx_bps: 450_000,
+      rx_packets_per_sec: 120,
+      tx_packets_per_sec: 95,
+      total_rx_bytes: 18_400_000_000,
+      total_tx_bytes: 12_800_000_000,
+      comment: 'VLAN 30 IoT & Smart Home Devices',
+      is_wan: false,
+    },
+    {
+      id: '*6',
+      name: 'sfp-plus1-NAS',
+      type: 'sfp',
+      mac_address: 'DC:2C:6E:9A:01:F6',
+      running: true,
+      disabled: false,
+      rx_bps: 5_200_000,
+      tx_bps: 8_900_000,
+      rx_packets_per_sec: 640,
+      tx_packets_per_sec: 890,
+      total_rx_bytes: 98_000_000_000,
+      total_tx_bytes: 145_000_000_000,
+      comment: '10G DAC Link to Synology Storage',
+      is_wan: false,
+    },
+  ];
+
+  private clients: ClientDevice[] = [
+    {
+      id: 'c1',
+      hostname: 'MacBookPro-Work',
+      alias: 'Work MacBook Pro M3',
+      ip_address: '192.168.88.102',
+      mac_address: '3C:06:30:1F:B4:88',
+      vendor: 'Apple, Inc.',
+      interface: 'ether2-LAN-Core',
+      connection_type: 'ethernet',
+      status: 'active',
+      rx_rate_bps: 12_400_000,
+      tx_rate_bps: 4_200_000,
+      total_download_bytes: 42_500_000_000,
+      total_upload_bytes: 12_300_000_000,
+      uptime: '4d 11h',
+      last_seen: 'Just now',
+      is_blocked: false,
+      block_method: 'firewall_address_list',
+      max_download_limit: 'Uncapped',
+      max_upload_limit: 'Uncapped',
+      schedules: [],
+      blocked_games: [],
+      blocked_websites: [],
+      custom_blocked_domains: [],
+      dhcp_status: 'static',
+    },
+    {
+      id: 'c2',
+      hostname: 'iPad-Kids-Bedroom',
+      alias: "Kids' iPad (Study Room)",
+      ip_address: '192.168.88.115',
+      mac_address: 'AC:BC:32:8E:71:02',
+      vendor: 'Apple, Inc.',
+      interface: 'wlan1-Home-5GHz',
+      connection_type: 'wifi_5ghz',
+      status: 'active',
+      rx_rate_bps: 6_800_000,
+      tx_rate_bps: 420_000,
+      total_download_bytes: 18_900_000_000,
+      total_upload_bytes: 1_200_000_000,
+      uptime: '1d 06h',
+      last_seen: 'Just now',
+      is_blocked: false,
+      block_method: 'firewall_address_list',
+      queue_id: 'q-kids-ipad',
+      max_download_limit: '10M',
+      max_upload_limit: '2M',
+      schedules: [
+        {
+          id: 'slot-1',
+          name: 'After-School Homework Time',
+          enabled: true,
+          days: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],
+          start_time: '15:30',
+          end_time: '18:00',
+          action: 'block_games',
+          comment: 'Block Roblox, Minecraft, & mobile games during study',
+        },
+        {
+          id: 'slot-2',
+          name: 'Nightly Bedtime Internet Lockout',
+          enabled: true,
+          days: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sun'],
+          start_time: '21:00',
+          end_time: '06:30',
+          action: 'block_all',
+          comment: 'Completely cut off internet access during sleeping hours',
+        },
+        {
+          id: 'slot-3',
+          name: 'Weekend Morning Throttle',
+          enabled: false,
+          days: ['Sat', 'Sun'],
+          start_time: '07:00',
+          end_time: '09:00',
+          action: 'throttle',
+          throttle_speed: '1M/512k',
+          comment: 'Restrict speed before family breakfast',
+        },
+      ],
+      blocked_games: ['roblox', 'minecraft', 'brawl_stars'],
+      blocked_websites: ['tiktok', 'youtube'],
+      custom_blocked_domains: ['discord.com'],
+      dhcp_status: 'bound',
+    },
+    {
+      id: 'c3',
+      hostname: 'PlayStation-5',
+      alias: 'Living Room PS5 Console',
+      ip_address: '192.168.88.120',
+      mac_address: '00:D9:D1:43:88:AC',
+      vendor: 'Sony Interactive Ent.',
+      interface: 'ether2-LAN-Core',
+      connection_type: 'ethernet',
+      status: 'active',
+      rx_rate_bps: 18_900_000,
+      tx_rate_bps: 2_100_000,
+      total_download_bytes: 84_100_000_000,
+      total_upload_bytes: 8_200_000_000,
+      uptime: '2d 08h',
+      last_seen: 'Just now',
+      is_blocked: false,
+      block_method: 'firewall_address_list',
+      queue_id: 'q-gaming-ps5',
+      max_download_limit: '50M',
+      max_upload_limit: '20M',
+      schedules: [
+        {
+          id: 'ps5-slot-1',
+          name: 'School Night Gaming Cap',
+          enabled: true,
+          days: ['Mon', 'Tue', 'Wed', 'Thu', 'Sun'],
+          start_time: '22:00',
+          end_time: '07:00',
+          action: 'block_all',
+          comment: 'Turn off console online access late night',
+        },
+      ],
+      blocked_games: [],
+      blocked_websites: [],
+      custom_blocked_domains: [],
+      dhcp_status: 'static',
+    },
+    {
+      id: 'c4',
+      hostname: 'Galaxy-S24-Ultra',
+      alias: "Dad's Phone",
+      ip_address: '192.168.88.109',
+      mac_address: '58:CB:52:6A:9C:14',
+      vendor: 'Samsung Electronics',
+      interface: 'wlan1-Home-5GHz',
+      connection_type: 'wifi_6',
+      status: 'active',
+      rx_rate_bps: 3_100_000,
+      tx_rate_bps: 890_000,
+      total_download_bytes: 14_200_000_000,
+      total_upload_bytes: 4_100_000_000,
+      uptime: '3d 14h',
+      last_seen: 'Just now',
+      is_blocked: false,
+      block_method: 'firewall_address_list',
+      max_download_limit: 'Uncapped',
+      max_upload_limit: 'Uncapped',
+      schedules: [],
+      blocked_games: [],
+      blocked_websites: [],
+      custom_blocked_domains: [],
+      dhcp_status: 'bound',
+    },
+    {
+      id: 'c5',
+      hostname: 'Unknown-Android-Device',
+      alias: 'Guest Phone (Suspect/Blocked)',
+      ip_address: '192.168.88.188',
+      mac_address: '92:44:E1:92:0B:44',
+      vendor: 'Xiaomi Communications',
+      interface: 'wlan1-Home-5GHz',
+      connection_type: 'wifi_5ghz',
+      status: 'blocked',
+      rx_rate_bps: 0,
+      tx_rate_bps: 0,
+      total_download_bytes: 3_400_000_000,
+      total_upload_bytes: 420_000_000,
+      uptime: '12h 45m',
+      last_seen: '2 mins ago',
+      is_blocked: true,
+      block_method: 'firewall_address_list',
+      max_download_limit: 'Blocked',
+      max_upload_limit: 'Blocked',
+      schedules: [],
+      blocked_games: [],
+      blocked_websites: [],
+      custom_blocked_domains: [],
+      dhcp_status: 'bound',
+    },
+    {
+      id: 'c6',
+      hostname: 'LG-OLED-65-C3',
+      alias: 'Living Room Smart TV',
+      ip_address: '192.168.88.133',
+      mac_address: 'A8:23:FE:19:94:E1',
+      vendor: 'LG Electronics',
+      interface: 'wlan1-Home-5GHz',
+      connection_type: 'wifi_5ghz',
+      status: 'active',
+      rx_rate_bps: 8_500_000,
+      tx_rate_bps: 120_000,
+      total_download_bytes: 52_000_000_000,
+      total_upload_bytes: 840_000_000,
+      uptime: '5d 02h',
+      last_seen: 'Just now',
+      is_blocked: false,
+      block_method: 'firewall_address_list',
+      queue_id: 'q-smart-tv',
+      max_download_limit: '30M',
+      max_upload_limit: '5M',
+      schedules: [],
+      blocked_games: [],
+      blocked_websites: [],
+      custom_blocked_domains: [],
+      dhcp_status: 'bound',
+    },
+    {
+      id: 'c7',
+      hostname: 'Philips-Hue-Bridge',
+      alias: 'Hue Zigbee Bridge',
+      ip_address: '192.168.88.24',
+      mac_address: 'EC:B5:FA:88:12:44',
+      vendor: 'Signify Netherlands',
+      interface: 'ether2-LAN-Core',
+      connection_type: 'ethernet',
+      status: 'idle',
+      rx_rate_bps: 45_000,
+      tx_rate_bps: 28_000,
+      total_download_bytes: 320_000_000,
+      total_upload_bytes: 180_000_000,
+      uptime: '18d 04h',
+      last_seen: 'Just now',
+      is_blocked: false,
+      block_method: 'firewall_address_list',
+      max_download_limit: 'Uncapped',
+      max_upload_limit: 'Uncapped',
+      schedules: [],
+      blocked_games: [],
+      blocked_websites: [],
+      custom_blocked_domains: [],
+      dhcp_status: 'static',
+    },
+    {
+      id: 'c8',
+      hostname: 'Sonos-Beam-Soundbar',
+      alias: 'Living Room Soundbar',
+      ip_address: '192.168.88.140',
+      mac_address: '48:A6:B8:11:09:DE',
+      vendor: 'Sonos, Inc.',
+      interface: 'wlan2-IoT-2.4GHz',
+      connection_type: 'wifi_2ghz',
+      status: 'idle',
+      rx_rate_bps: 320_000,
+      tx_rate_bps: 45_000,
+      total_download_bytes: 4_500_000_000,
+      total_upload_bytes: 310_000_000,
+      uptime: '8d 19h',
+      last_seen: 'Just now',
+      is_blocked: false,
+      block_method: 'firewall_address_list',
+      max_download_limit: 'Uncapped',
+      max_upload_limit: 'Uncapped',
+      schedules: [],
+      blocked_games: [],
+      blocked_websites: [],
+      custom_blocked_domains: [],
+      dhcp_status: 'bound',
+    },
+  ];
+
+  private queues: SimpleQueue[] = [
+    {
+      id: 'q-kids-ipad',
+      name: 'Kids-iPad-Throttle',
+      target: '192.168.88.115/32',
+      max_limit_upload: '2M',
+      max_limit_download: '10M',
+      burst_limit_upload: '4M',
+      burst_limit_download: '15M',
+      burst_threshold_upload: '1M',
+      burst_threshold_download: '8M',
+      burst_time: '16s/16s',
+      priority: 6,
+      current_rate_upload_bps: 420_000,
+      current_rate_download_bps: 6_800_000,
+      total_bytes_upload: 1_200_000_000,
+      total_bytes_download: 18_900_000_000,
+      packet_drops: 12,
+      disabled: false,
+      dynamic: false,
+      comment: 'Enforced parental bandwidth ceiling for homework & bedtime',
+    },
+    {
+      id: 'q-gaming-ps5',
+      name: 'PS5-Gaming-Priority',
+      target: '192.168.88.120/32',
+      max_limit_upload: '25M',
+      max_limit_download: '60M',
+      burst_limit_upload: '35M',
+      burst_limit_download: '100M',
+      burst_threshold_upload: '20M',
+      burst_threshold_download: '50M',
+      burst_time: '8s/8s',
+      priority: 2,
+      current_rate_upload_bps: 2_100_000,
+      current_rate_download_bps: 18_900_000,
+      total_bytes_upload: 8_200_000_000,
+      total_bytes_download: 84_100_000_000,
+      packet_drops: 0,
+      disabled: false,
+      dynamic: false,
+      comment: 'Low-latency gaming priority with burst queue',
+    },
+    {
+      id: 'q-smart-tv',
+      name: 'Smart-TV-Streaming',
+      target: '192.168.88.133/32',
+      max_limit_upload: '5M',
+      max_limit_download: '30M',
+      priority: 4,
+      current_rate_upload_bps: 120_000,
+      current_rate_download_bps: 8_500_000,
+      total_bytes_upload: 840_000_000,
+      total_bytes_download: 52_000_000_000,
+      packet_drops: 2,
+      disabled: false,
+      dynamic: false,
+      comment: 'Ensures 4K Dolby Vision bitrate without choking network',
+    },
+    {
+      id: 'q-guest-subnet',
+      name: 'Guest-Subnet-Cap',
+      target: '192.168.88.128/25',
+      max_limit_upload: '5M',
+      max_limit_download: '20M',
+      priority: 8,
+      current_rate_upload_bps: 0,
+      current_rate_download_bps: 0,
+      total_bytes_upload: 3_400_000_000,
+      total_bytes_download: 12_800_000_000,
+      packet_drops: 88,
+      disabled: false,
+      dynamic: false,
+      comment: 'Overall cap on guest VLAN and non-static clients',
+    },
+  ];
+
+  private schedules: RouterSchedule[] = [
+    {
+      id: 'sch-bedtime-kids',
+      name: 'Bedtime-Lockout-Enable',
+      start_date: '2026-01-01',
+      start_time: '21:00:00',
+      interval: '1d',
+      on_event: '/ip firewall address-list add list=ha_blocked_users address=192.168.88.115 timeout=9h comment="HA Auto Bedtime"',
+      run_count: 142,
+      next_run: 'Today 21:00:00',
+      disabled: false,
+      comment: 'Automatic nightly internet cutoff for kids tablet',
+    },
+    {
+      id: 'sch-weekly-backup',
+      name: 'Weekly-Cloud-Backup',
+      start_date: '2026-01-01',
+      start_time: '03:30:00',
+      interval: '7d',
+      on_event: '/system backup save name=("cloud_backup_" . [:pick [/system clock get date] 7 11])',
+      run_count: 24,
+      next_run: 'Sun 03:30:00',
+      disabled: false,
+      comment: 'RouterOS configuration binary snapshot backup',
+    },
+    {
+      id: 'sch-reboot-clean',
+      name: 'Monthly-Maintenance-Reboot',
+      start_date: '2026-01-01',
+      start_time: '04:00:00',
+      interval: '30d',
+      on_event: ':log info "Home Assistant Scheduled Reboot"; /system reboot',
+      run_count: 3,
+      next_run: 'In 12 days',
+      disabled: true,
+      comment: 'Scheduled soft reboot to clear memory cache',
+    },
+    {
+      id: 'sch-fasttrack-dns-flush',
+      name: 'Flush-Stale-DNS-Cache',
+      start_date: '2026-01-01',
+      start_time: '00:00:00',
+      interval: '12h',
+      on_event: '/ip dns cache flush',
+      run_count: 890,
+      next_run: 'Today 12:00:00',
+      disabled: false,
+      comment: 'Regular DNS resolver cache sanitation',
+    },
+  ];
+
+  private firewallRules: FirewallFilterRule[] = [
+    {
+      id: 'fw-1',
+      order: 1,
+      chain: 'input',
+      action: 'accept',
+      connection_state: 'established,related,untracked',
+      packets: 489_200,
+      bytes: 384_100_000,
+      disabled: false,
+      comment: 'defconf: accept established,related,untracked',
+    },
+    {
+      id: 'fw-2',
+      order: 2,
+      chain: 'input',
+      action: 'drop',
+      connection_state: 'invalid',
+      packets: 14_210,
+      bytes: 720_000,
+      disabled: false,
+      comment: 'defconf: drop invalid packets',
+    },
+    {
+      id: 'fw-3',
+      order: 3,
+      chain: 'input',
+      action: 'accept',
+      protocol: 'icmp',
+      packets: 2_400,
+      bytes: 192_000,
+      disabled: false,
+      comment: 'defconf: accept ICMP ping from LAN',
+    },
+    {
+      id: 'fw-4',
+      order: 4,
+      chain: 'forward',
+      action: 'fasttrack-connection',
+      connection_state: 'established,related',
+      packets: 8_920_400,
+      bytes: 11_400_000_000,
+      disabled: false,
+      comment: 'defconf: fasttrack established traffic for maximum throughput',
+    },
+    {
+      id: 'fw-game-roblox',
+      order: 5,
+      chain: 'forward',
+      action: 'drop',
+      src_address: '192.168.88.115',
+      tls_host: '*roblox*',
+      packets: 18_420,
+      bytes: 1_210_000,
+      disabled: false,
+      comment: 'Parental Shield: Block Roblox for iPad-Kids-Bedroom',
+    },
+    {
+      id: 'fw-game-minecraft',
+      order: 6,
+      chain: 'forward',
+      action: 'drop',
+      src_address: '192.168.88.115',
+      protocol: 'tcp',
+      dst_port: '25565',
+      packets: 8_940,
+      bytes: 620_000,
+      disabled: false,
+      comment: 'Parental Shield: Block Minecraft Server Port 25565 for Kids iPad',
+    },
+    {
+      id: 'fw-web-tiktok',
+      order: 7,
+      chain: 'forward',
+      action: 'drop',
+      src_address: '192.168.88.115',
+      tls_host: '*tiktok*',
+      packets: 32_100,
+      bytes: 2_450_000,
+      disabled: false,
+      comment: 'Parental Shield: Block TikTok app & web feed for Kids iPad',
+    },
+    {
+      id: 'fw-block-users',
+      order: 8,
+      chain: 'forward',
+      action: 'drop',
+      src_address_list: 'ha_blocked_users',
+      packets: 23_840,
+      bytes: 1_820_000,
+      disabled: false,
+      comment: 'HA Add-on: Block Internet access for marked devices',
+    },
+    {
+      id: 'fw-drop-invalid',
+      order: 9,
+      chain: 'forward',
+      action: 'drop',
+      connection_state: 'invalid',
+      packets: 5_100,
+      bytes: 340_000,
+      disabled: false,
+      comment: 'defconf: drop invalid forwarding',
+    },
+    {
+      id: 'fw-wan-drop',
+      order: 10,
+      chain: 'forward',
+      action: 'drop',
+      in_interface: 'ether1-WAN',
+      connection_state: 'new',
+      packets: 112_400,
+      bytes: 7_800_000,
+      disabled: false,
+      comment: 'defconf: drop all incoming from WAN not DSTNATed',
+    },
+  ];
+
+  private addressLists: AddressListEntry[] = [
+    {
+      id: 'al-1',
+      list: 'ha_blocked_users',
+      address: '192.168.88.188',
+      disabled: false,
+      creation_time: '2026-10-14 18:22:10',
+      dynamic: false,
+      comment: 'Blocked via Home Assistant: Unknown-Android-Device',
+    },
+    {
+      id: 'al-2',
+      list: 'iot_quarantine',
+      address: '192.168.88.200-192.168.88.254',
+      disabled: false,
+      creation_time: '2026-09-01 10:00:00',
+      dynamic: false,
+      comment: 'Isolated Smart Home IoT Range',
+    },
+    {
+      id: 'al-3',
+      list: 'ha_game_blocked_clients',
+      address: '192.168.88.115',
+      disabled: false,
+      creation_time: '2026-10-15 00:00:00',
+      dynamic: false,
+      comment: 'Game filtering active: Kids iPad',
+    },
+  ];
+
+  private natRules: NatRule[] = [
+    {
+      id: 'nat-1',
+      chain: 'srcnat',
+      action: 'masquerade',
+      out_interface: 'ether1-WAN',
+      packets: 9_120_000,
+      bytes: 11_800_000_000,
+      disabled: false,
+      comment: 'defconf: masquerade WAN outbound traffic',
+    },
+    {
+      id: 'nat-2',
+      chain: 'dstnat',
+      action: 'dst-nat',
+      protocol: 'tcp',
+      dst_port: '8123',
+      to_addresses: '192.168.88.10',
+      to_ports: '8123',
+      packets: 14_200,
+      bytes: 1_200_000,
+      disabled: false,
+      comment: 'Home Assistant Webhook Inbound Port Forward',
+    },
+  ];
+
+  private throughputHistory: ThroughputHistoryPoint[] = [];
+
+  private persistedClientsState: Record<
+    string,
+    {
+      alias?: string;
+      is_blocked?: boolean;
+      blocked_games?: string[];
+      blocked_websites?: string[];
+      custom_blocked_domains?: string[];
+      schedules?: RestrictionTimeSlot[];
+      max_download_limit?: string;
+      max_upload_limit?: string;
+    }
+  > = {};
+
+  private firewallLock: Promise<void> = Promise.resolve();
+
+  private async runWithFirewallLock<T>(fn: () => Promise<T>): Promise<T> {
+    const nextLock = this.firewallLock.then(async () => {
+      return await fn();
+    });
+    this.firewallLock = nextLock.then(
+      () => {},
+      () => {}
+    );
+    return nextLock;
+  }
+
+  /**
+   * Creates a filter rule and moves it to the top of the chain list so it is evaluated before
+   * fasttrack / accept rules. RouterOS REST `PUT` ignores `place-before`, so the rule is created
+   * first and then positioned with the `move` command. A failed move is not fatal (rule exists).
+   */
+  private async addFirewallFilterRuleToRouter(body: Record<string, any>): Promise<any> {
+    const created = await this.makeRouterOsRequest('/ip/firewall/filter', {
+      method: 'PUT',
+      body,
+    });
+    const newId = idOf(created);
+    if (newId) {
+      try {
+        const rules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3000 });
+        const firstId = Array.isArray(rules) && rules.length > 0 ? idOf(rules[0]) : undefined;
+        if (firstId && firstId !== newId) {
+          await this.makeRouterOsRequest('/ip/firewall/filter/move', {
+            method: 'POST',
+            body: { numbers: newId, destination: firstId },
+          });
+        }
+      } catch (err: any) {
+        console.warn(`[MikroTik RouterOS] Rule ${newId} created but could not be moved to top:`, errMsg(err));
+      }
+    }
+    return created;
+  }
+
+  /** Request that only reports failure into `failures` instead of throwing (used for bulk rule batches). */
+  private async tryRouter(failures: string[], what: string, fn: () => Promise<any>): Promise<any> {
+    try {
+      return await fn();
+    } catch (err: any) {
+      if (isAlreadyExistsError(err)) return null;
+      failures.push(`${what}: ${errMsg(err)}`);
+      return null;
+    }
+  }
+
+  private async deleteRouterItem(endpoint: string, id: string): Promise<void> {
+    try {
+      await this.makeRouterOsRequest(`${endpoint}/${id}`, { method: 'DELETE' });
+    } catch (err: any) {
+      // Already gone on the router -> treat as success
+      if (/no such item|not found|HTTP 404/i.test(errMsg(err))) return;
+      throw err;
+    }
+  }
+
+  /** Resolve a router-side `.id` for items that were created locally before the first sync. */
+  private async resolveRouterId(
+    endpoint: string,
+    id: string,
+    match: (item: any) => boolean
+  ): Promise<string> {
+    if (id.startsWith('*')) return id;
+    const items = await this.makeRouterOsRequest(endpoint, { timeoutMs: 3000 });
+    const found = Array.isArray(items) ? items.find(match) : null;
+    const rid = idOf(found);
+    if (!rid) throw new Error(`Item "${id}" does not exist on the router (it may have been removed)`);
+    return rid;
+  }
+
+  /** Force a full table re-sync from the router and wait for it, so the UI sees real state. */
+  public async refreshNow(): Promise<void> {
+    this.forceTableSync = true;
+    for (let i = 0; i < 30 && this.isSyncing; i++) await sleep(100);
+    await this.syncRealRouter().catch(() => {});
+  }
+
+  private getPersistedFilePath(): string {
+    const candidatePaths = [
+      '/data/clients_state.json',
+      path.resolve(process.cwd(), 'data', 'clients_state.json'),
+    ];
+    for (const p of candidatePaths) {
+      try {
+        const dir = path.dirname(p);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+        const testFile = path.join(dir, '.write_test');
+        fs.writeFileSync(testFile, 'ok');
+        fs.unlinkSync(testFile);
+        return p;
+      } catch {
+        // continue to next
+      }
+    }
+    return path.resolve(process.cwd(), 'clients_state.json');
+  }
+
+  private loadPersistedState() {
+    try {
+      // Read ONLY the file that savePersistedState() writes to. (Previously a stale copy baked into
+      // the image under /app/data overrode the real /data file after every add-on update.)
+      const p = this.getPersistedFilePath();
+      if (fs.existsSync(p)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'));
+          if (parsed && typeof parsed === 'object') this.persistedClientsState = parsed;
+        } catch (e) {
+          console.warn(`[MikroTik Manager] Could not parse ${p}:`, e);
+        }
+      }
+      console.log(
+        `[MikroTik Manager] Loaded persisted settings for ${
+          Object.keys(this.persistedClientsState).length
+        } client devices from ${p}.`
+      );
+    } catch (err) {
+      console.warn('[MikroTik Manager] Could not load persisted clients state:', err);
+    }
+  }
+
+  private savePersistedState() {
+    try {
+      const p = this.getPersistedFilePath();
+      const tmp = `${p}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(this.persistedClientsState, null, 2), 'utf-8');
+      fs.renameSync(tmp, p);
+    } catch (err) {
+      console.warn('[MikroTik Manager] Could not save persisted clients state:', err);
+    }
+  }
+
+  private async ensureBaseDropRule(): Promise<void> {
+    try {
+      const filters = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3000 });
+      if (Array.isArray(filters)) {
+        const hasRule = filters.some(
+          (f: any) =>
+            f.chain === 'forward' &&
+            f.action === 'drop' &&
+            (f['src-address-list'] === 'ha_blocked_users' ||
+              f.src_address_list === 'ha_blocked_users')
+        );
+        if (!hasRule) {
+          console.log('[MikroTik RouterOS] Creating base forward drop rule for ha_blocked_users...');
+          await this.addFirewallFilterRuleToRouter({
+            chain: 'forward',
+            action: 'drop',
+            'src-address-list': 'ha_blocked_users',
+            comment: 'HA Drop Blocked Devices',
+          });
+        }
+      }
+    } catch (err: any) {
+      console.warn(
+        '[MikroTik RouterOS] Could not verify/create base drop rule for ha_blocked_users:',
+        err.message
+      );
+    }
+  }
+
+  constructor() {
+    this.loadPersistedState();
+    this.seedThroughputHistory();
+    // Start continuous telemetry ticker
+    setInterval(() => this.tick(), 1000);
+    // Enforce per-device time restrictions on the router itself (not just in the UI simulator)
+    setInterval(() => this.enforceSchedules().catch(() => {}), 15_000);
+  }
+
+  private seedThroughputHistory() {
+    const now = Date.now();
+    for (let i = 40; i >= 0; i--) {
+      const t = now - i * 1000;
+      const date = new Date(t);
+      const time_label = `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}:${date.getSeconds().toString().padStart(2, '0')}`;
+      const baseRx = 35 + Math.sin(i * 0.2) * 15 + (Math.random() * 8 - 4);
+      const baseTx = 12 + Math.cos(i * 0.25) * 6 + (Math.random() * 4 - 2);
+      this.throughputHistory.push({
+        timestamp: t,
+        time_label,
+        wan_rx_mbps: Math.max(1, Number(baseRx.toFixed(2))),
+        wan_tx_mbps: Math.max(0.5, Number(baseTx.toFixed(2))),
+        lan_rx_mbps: Math.max(1, Number((baseTx * 0.95).toFixed(2))),
+        lan_tx_mbps: Math.max(1, Number((baseRx * 0.95).toFixed(2))),
+      });
+    }
+  }
+
+  private isTimeInWindow(startTime: string, endTime: string, currentHourMin: string): boolean {
+    if (startTime > endTime) {
+      // Overnight window (e.g. 21:00 to 06:30)
+      return currentHourMin >= startTime || currentHourMin < endTime;
+    }
+    // Daytime window (e.g. 15:30 to 18:00)
+    return currentHourMin >= startTime && currentHourMin <= endTime;
+  }
+
+  private getDayOfWeek(date: Date): DayOfWeek {
+    const days: DayOfWeek[] = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    return days[date.getDay()];
+  }
+
+  private tick() {
+    const now = Date.now();
+    const date = new Date(now);
+    const time_label = `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}:${date.getSeconds().toString().padStart(2, '0')}`;
+    const curTimeStr = `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
+    const currentDay = this.getDayOfWeek(date);
+
+    // Periodic synchronization with live MikroTik RouterOS
+    if (this.config.host) {
+      this.syncRealRouter().catch(() => {});
+    }
+
+    // Fluctuate CPU slightly if not provided by router
+    if (!this.config.connected) {
+      this.routerInfo.cpu_load_percent = Math.min(
+        95,
+        Math.max(8, Math.round(this.routerInfo.cpu_load_percent + (Math.random() * 6 - 3)))
+      );
+      this.routerInfo.uptime_seconds += 1;
+    }
+
+    // Check panic killswitch
+    if (this.panicKillswitchActive) {
+      const wan = this.interfaces.find((i) => i.is_wan);
+      if (wan) {
+        wan.rx_bps = 8000;
+        wan.tx_bps = 2000;
+      }
+      for (const client of this.clients) {
+        client.rx_rate_bps = 0;
+        client.tx_rate_bps = 0;
+      }
+      this.throughputHistory.push({
+        timestamp: now,
+        time_label,
+        wan_rx_mbps: 0.01,
+        wan_tx_mbps: 0.01,
+        lan_rx_mbps: 0.05,
+        lan_tx_mbps: 0.05,
+      });
+      if (this.throughputHistory.length > 60) this.throughputHistory.shift();
+      return;
+    }
+
+    let calculatedWanRx = 0;
+    let calculatedWanTx = 0;
+
+    // Live update bandwidth, QoS queues, and restrictions for all clients
+    for (const client of this.clients) {
+      if (client.is_blocked) {
+        client.rx_rate_bps = 0;
+        client.tx_rate_bps = 0;
+        client.status = 'blocked';
+        continue;
+      }
+
+      // Multi-Restriction Time Slots Evaluation
+      let activeRestrictionAction: RestrictionTimeSlot['action'] | null = null;
+      let activeThrottleSpeed = '1M/512k';
+
+      if (client.schedules && client.schedules.length > 0) {
+        for (const slot of client.schedules) {
+          if (!slot.enabled) continue;
+          if (!slot.days.includes(currentDay)) continue;
+
+          if (this.isTimeInWindow(slot.start_time, slot.end_time, curTimeStr)) {
+            activeRestrictionAction = slot.action;
+            if (slot.throttle_speed) {
+              activeThrottleSpeed = slot.throttle_speed;
+            }
+            break;
+          }
+        }
+      }
+
+      // If time restriction action is block_all:
+      if (activeRestrictionAction === 'block_all') {
+        client.rx_rate_bps = 0;
+        client.tx_rate_bps = 0;
+        client.status = 'blocked';
+        continue;
+      }
+
+      // Speed ceiling from Simple Queue
+      let maxDownBps = 100_000_000;
+      if (client.max_download_limit && client.max_download_limit.endsWith('M')) {
+        maxDownBps = parseFloat(client.max_download_limit) * 1_000_000;
+      }
+
+      if (activeRestrictionAction === 'throttle') {
+        maxDownBps = Math.min(maxDownBps, 1_000_000);
+      }
+
+      let rxFactor = 1.0;
+      if (activeRestrictionAction === 'block_games' || (client.blocked_games && client.blocked_games.length > 0)) {
+        rxFactor *= 0.45;
+      }
+      if (activeRestrictionAction === 'block_websites' || (client.blocked_websites && client.blocked_websites.length > 0)) {
+        rxFactor *= 0.55;
+      }
+
+      // Check if there is a matching Simple Queue with real router rate
+      const matchingQueue = this.queues.find((q) => targetMatchesIp(q.target, client.ip_address));
+      if (matchingQueue && matchingQueue.current_rate_download_bps > 0) {
+        client.rx_rate_bps = matchingQueue.current_rate_download_bps;
+        client.tx_rate_bps = matchingQueue.current_rate_upload_bps;
+      } else {
+        // Dynamic live bandwidth pulsation
+        const hostLower = (client.hostname + ' ' + client.alias).toLowerCase();
+        let baseRx = 900_000;
+        let baseTx = 150_000;
+
+        if (hostLower.includes('macbook') || hostLower.includes('pc') || hostLower.includes('laptop')) {
+          baseRx = 3_200_000;
+          baseTx = 600_000;
+        } else if (hostLower.includes('oled') || hostLower.includes('tv') || hostLower.includes('soundbar')) {
+          baseRx = 6_500_000;
+          baseTx = 80_000;
+        } else if (hostLower.includes('playstation') || hostLower.includes('xbox') || hostLower.includes('switch')) {
+          baseRx = 4_800_000;
+          baseTx = 750_000;
+        } else if (hostLower.includes('ipad') || hostLower.includes('phone') || hostLower.includes('iphone')) {
+          baseRx = 1_800_000;
+          baseTx = 220_000;
+        }
+
+        const deltaRx = (Math.random() * 2_000_000 - 1_000_000);
+        const deltaTx = (Math.random() * 400_000 - 200_000);
+        const currentRx = Math.min(maxDownBps, Math.max(80_000, (client.rx_rate_bps || baseRx) * 0.7 + (baseRx + deltaRx) * 0.3) * rxFactor);
+        const currentTx = Math.max(30_000, (client.tx_rate_bps || baseTx) * 0.7 + (baseTx + deltaTx) * 0.3);
+
+        client.rx_rate_bps = Math.round(currentRx);
+        client.tx_rate_bps = Math.round(currentTx);
+      }
+
+      client.status = client.rx_rate_bps > 50_000 ? 'active' : 'idle';
+      client.total_download_bytes += Math.round(client.rx_rate_bps / 8);
+      client.total_upload_bytes += Math.round(client.tx_rate_bps / 8);
+
+      calculatedWanRx += client.rx_rate_bps;
+      calculatedWanTx += client.tx_rate_bps;
+    }
+
+    calculatedWanRx += 1_200_000; // Network infrastructure overhead
+    calculatedWanTx += 400_000;
+
+    // Update Simple Queues
+    for (const queue of this.queues) {
+      const client = this.clients.find((c) => targetMatchesIp(queue.target, c.ip_address));
+      if (client) {
+        queue.current_rate_download_bps = client.rx_rate_bps;
+        queue.current_rate_upload_bps = client.tx_rate_bps;
+        queue.total_bytes_download += Math.round(client.rx_rate_bps / 8);
+        queue.total_bytes_upload += Math.round(client.tx_rate_bps / 8);
+      }
+    }
+
+    const wan = this.interfaces.find((i) => i.is_wan);
+    if (wan) {
+      if (!this.config.connected || wan.rx_bps === 0) {
+        wan.rx_bps = Math.round(calculatedWanRx);
+        wan.tx_bps = Math.round(calculatedWanTx);
+        wan.total_rx_bytes += Math.round(calculatedWanRx / 8);
+        wan.total_tx_bytes += Math.round(calculatedWanTx / 8);
+      }
+    }
+
+    const finalWanRx = wan ? wan.rx_bps : calculatedWanRx;
+    const finalWanTx = wan ? wan.tx_bps : calculatedWanTx;
+
+    const wanRxMbps = Number((finalWanRx / 1_000_000).toFixed(2));
+    const wanTxMbps = Number((finalWanTx / 1_000_000).toFixed(2));
+
+    this.throughputHistory.push({
+      timestamp: now,
+      time_label,
+      wan_rx_mbps: wanRxMbps,
+      wan_tx_mbps: wanTxMbps,
+      lan_rx_mbps: Number((wanTxMbps * 0.96).toFixed(2)),
+      lan_tx_mbps: Number((wanRxMbps * 0.98).toFixed(2)),
+    });
+
+    if (this.throughputHistory.length > 60) {
+      this.throughputHistory.shift();
+    }
+  }
+
+  private lastPollWanBytes: { rx: number; tx: number; time: number } | null = null;
+  private isSyncing = false;
+  private syncCount = 0;
+  private forceTableSync = false;
+  private isEnforcingSchedules = false;
+
+  /** Match "Block <Name> ..." rule comments to a catalog entry by exact name (longest name wins). */
+  private matchCatalogItem<T extends { id: string; name: string }>(items: T[], rest: string): T | null {
+    const m = rest.match(/^Block\s+(.+)$/i);
+    if (!m) return null;
+    const text = m[1].toLowerCase();
+    let best: T | null = null;
+    for (const it of items) {
+      const n = it.name.toLowerCase();
+      if (text === n || text.startsWith(`${n} `) || text.startsWith(`${n}(`)) {
+        if (!best || n.length > best.name.length) best = it;
+      }
+    }
+    return best;
+  }
+
+  private async syncRealRouter() {
+    if (this.isSyncing) return;
+    if (!this.config.host) return;
+
+    this.isSyncing = true;
+    try {
+      // 1. Query system resource
+      const sys = await this.makeRouterOsRequest('/system/resource', { timeoutMs: 3500 });
+      if (sys) {
+        this.config.connected = true;
+        this.config.last_error = undefined;
+        this.config.last_sync = new Date().toISOString();
+
+        this.routerInfo.model = sys['board-name'] || sys.board_name || this.routerInfo.model;
+        this.routerInfo.routeros_version = sys.version || this.routerInfo.routeros_version;
+        if (sys['cpu-load'] !== undefined || sys.cpu_load !== undefined) {
+          this.routerInfo.cpu_load_percent = Number(sys['cpu-load'] ?? sys.cpu_load);
+        }
+        if (sys['free-memory']) {
+          this.routerInfo.free_memory_mb = Math.round(Number(sys['free-memory']) / (1024 * 1024));
+        }
+        if (sys['total-memory']) {
+          this.routerInfo.total_memory_mb = Math.round(Number(sys['total-memory']) / (1024 * 1024));
+        }
+        if (sys.uptime) {
+          this.routerInfo.uptime = String(sys.uptime);
+        }
+      }
+
+      // 2. Query interfaces and calculate live throughput
+      try {
+        const ifaces = await this.makeRouterOsRequest('/interface', { timeoutMs: 3000 });
+        if (Array.isArray(ifaces) && ifaces.length > 0) {
+          const now = Date.now();
+          let wanRxBps = 0;
+          let wanTxBps = 0;
+
+          const wanItem = ifaces.find((i: any) =>
+            i.comment?.toLowerCase().includes('wan') ||
+            i.name?.toLowerCase().includes('wan') ||
+            i.name?.toLowerCase().includes('ether1')
+          ) || ifaces[0];
+
+          if (wanItem && this.lastPollWanBytes) {
+            const dt = Math.max(0.5, (now - this.lastPollWanBytes.time) / 1000);
+            const curRx = Number(wanItem['rx-byte'] || 0);
+            const curTx = Number(wanItem['tx-byte'] || 0);
+            const dRx = Math.max(0, curRx - this.lastPollWanBytes.rx);
+            const dTx = Math.max(0, curTx - this.lastPollWanBytes.tx);
+            wanRxBps = Math.round((dRx * 8) / dt);
+            wanTxBps = Math.round((dTx * 8) / dt);
+          }
+
+          if (wanItem) {
+            this.lastPollWanBytes = {
+              rx: Number(wanItem['rx-byte'] || 0),
+              tx: Number(wanItem['tx-byte'] || 0),
+              time: now,
+            };
+          }
+
+          this.interfaces = ifaces.map((i: any) => ({
+            id: i['.id'] || i.id || String(Math.random()),
+            name: i.name,
+            type: i.type || 'ethernet',
+            mac_address: i['mac-address'] || '',
+            running: i.running === 'true' || i.running === true,
+            disabled: i.disabled === 'true' || i.disabled === true,
+            rx_bps: i.name === wanItem?.name ? wanRxBps : 0,
+            tx_bps: i.name === wanItem?.name ? wanTxBps : 0,
+            rx_packets_per_sec: Number(i['rx-packet'] || 0) % 1000,
+            tx_packets_per_sec: Number(i['tx-packet'] || 0) % 1000,
+            total_rx_bytes: Number(i['rx-byte'] || 0),
+            total_tx_bytes: Number(i['tx-byte'] || 0),
+            comment: i.comment || '',
+            is_wan: i.name === wanItem?.name,
+          }));
+
+          const d = new Date(now);
+          const time_label = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
+          this.throughputHistory.push({
+            timestamp: now,
+            time_label,
+            wan_rx_mbps: Number((wanRxBps / 1_000_000).toFixed(2)),
+            wan_tx_mbps: Number((wanTxBps / 1_000_000).toFixed(2)),
+            lan_rx_mbps: Number((wanTxBps * 0.95 / 1_000_000).toFixed(2)),
+            lan_tx_mbps: Number((wanRxBps * 0.95 / 1_000_000).toFixed(2)),
+          });
+          if (this.throughputHistory.length > 60) {
+            this.throughputHistory.shift();
+          }
+        }
+      } catch (ifErr) {
+        // continue
+      }
+
+      // Sync other tables every 3 polls (3 seconds) to ensure real-time consistency
+      this.syncCount++;
+      if (this.forceTableSync || this.syncCount % 3 === 0) {
+        this.forceTableSync = false;
+        try {
+          const [leases, addrLists, qs, fw, sch, arpEntries] = await Promise.all([
+            this.makeRouterOsRequest('/ip/dhcp-server/lease', { timeoutMs: 3500 }).catch(() => null),
+            this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3500 }).catch(() => null),
+            this.makeRouterOsRequest('/queue/simple', { timeoutMs: 3500 }).catch(() => null),
+            this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 }).catch(() => null),
+            this.makeRouterOsRequest('/system/scheduler', { timeoutMs: 3500 }).catch(() => null),
+            this.makeRouterOsRequest('/ip/arp', { timeoutMs: 3500 }).catch(() => null),
+          ]);
+
+          if (Array.isArray(addrLists)) {
+            this.addressLists = addrLists.map((a: any) => ({
+              id: a['.id'] || a.id,
+              list: a.list || '',
+              address: a.address || '',
+              disabled: a.disabled === 'true' || a.disabled === true,
+              creation_time: a['creation-time'] || '',
+              dynamic: a.dynamic === 'true' || a.dynamic === true,
+              comment: a.comment || '',
+            }));
+          }
+
+          const addrListsOk = Array.isArray(addrLists);
+          const fwOk = Array.isArray(fw);
+          const qsOk = Array.isArray(qs);
+          const blockedIps = new Set(
+            this.addressLists
+              .filter((a) => a.list === 'ha_blocked_users' && !a.disabled)
+              .map((a) => a.address)
+          );
+
+          // The panic switch lives on the router; read it back so a refresh/restart keeps the real state
+          if (fwOk) {
+            const panicRule = fw.find((r: any) => String(r.comment || '').includes('HA Panic Emergency Killswitch'));
+            this.panicKillswitchActive = Boolean(panicRule && !isTrue(panicRule.disabled));
+          }
+
+          // Build a unified device map combining DHCP leases and active ARP table
+          const discoveredMap = new Map<string, any>();
+
+          if (Array.isArray(leases)) {
+            for (const l of leases) {
+              const ip = l['active-address'] || l.address;
+              if (ip) {
+                discoveredMap.set(ip, {
+                  ip,
+                  mac: l['active-mac-address'] || l['mac-address'] || '',
+                  host: l['active-host-name'] || l['host-name'] || l.comment || '',
+                  interface: l.server || 'bridge',
+                  status: l.status || 'bound',
+                  lastSeen: l['last-seen'] || 'Active',
+                });
+              }
+            }
+          }
+
+          if (Array.isArray(arpEntries)) {
+            for (const a of arpEntries) {
+              const ip = a.address;
+              if (ip && !discoveredMap.has(ip) && !ip.endsWith('.255') && !ip.startsWith('127.')) {
+                discoveredMap.set(ip, {
+                  ip,
+                  mac: a['mac-address'] || '',
+                  host: a.comment || `Device-${ip.split('.').slice(-1)[0]}`,
+                  interface: a.interface || 'bridge',
+                  status: a.complete === 'true' || a.complete === true ? 'bound' : 'waiting',
+                  lastSeen: 'Active (ARP)',
+                });
+              }
+            }
+          }
+
+          // Detect game and website shield rules directly from RouterOS active firewall filter
+          const routerDetectedBlockedGamesByIp = new Map<string, Set<string>>();
+          const routerDetectedBlockedWebsByIp = new Map<string, Set<string>>();
+          const routerDetectedCustomDomainsByIp = new Map<string, Set<string>>();
+
+          if (fwOk) {
+            for (const r of fw) {
+              if (isTrue(r.disabled)) continue;
+              const comment = String(r.comment || '');
+              const m = comment.match(/^(?:Game Shield|HA Game|Web Shield|HA Web)\s*\[([0-9.]+)\]:\s*(.+)$/i);
+              if (!m) continue;
+              const ip = m[1];
+              const rest = m[2].trim();
+              const isGame = /^(?:Game Shield|HA Game)/i.test(comment);
+              if (isGame) {
+                const hit = this.matchCatalogItem(POPULAR_GAMES, rest);
+                if (hit) {
+                  if (!routerDetectedBlockedGamesByIp.has(ip)) routerDetectedBlockedGamesByIp.set(ip, new Set());
+                  routerDetectedBlockedGamesByIp.get(ip)!.add(hit.id);
+                }
+              } else {
+                if (/^Custom Domains List$/i.test(rest)) continue;
+                const custom = rest.match(/^Custom\s+\(?(?:\*\.)?([^\s)]+)\)?/i);
+                if (custom) {
+                  if (!routerDetectedCustomDomainsByIp.has(ip)) routerDetectedCustomDomainsByIp.set(ip, new Set());
+                  routerDetectedCustomDomainsByIp.get(ip)!.add(custom[1].trim().toLowerCase());
+                } else {
+                  const hit = this.matchCatalogItem(POPULAR_WEBSITES, rest);
+                  if (hit) {
+                    if (!routerDetectedBlockedWebsByIp.has(ip)) routerDetectedBlockedWebsByIp.set(ip, new Set());
+                    routerDetectedBlockedWebsByIp.get(ip)!.add(hit.id);
+                  }
+                }
+              }
+            }
+          }
+
+          if (discoveredMap.size > 0) {
+            const rawClientsList = Array.from(discoveredMap.values());
+            this.clients = rawClientsList.map((d: any, idx: number) => {
+              const ip = d.ip;
+              const mac = d.mac;
+              const host = d.host || `Client-${ip.split('.').slice(-1)[0]}`;
+
+              const prev = this.clients.find((c) => c.ip_address === ip || (mac && c.mac_address === mac));
+              const queueMatch = qsOk
+                ? qs.find((q: any) => targetMatchesIp(q.target, ip) && !String(q.name || '').startsWith('HA-Throttle-')) || null
+                : null;
+
+              let rxBps = prev ? prev.rx_rate_bps : 750000;
+              let txBps = prev ? prev.tx_rate_bps : 180000;
+              let downBytes = prev ? prev.total_download_bytes : 1024 * 1024 * 50;
+              let upBytes = prev ? prev.total_upload_bytes : 1024 * 1024 * 10;
+
+              if (queueMatch) {
+                const rates = (queueMatch.rate || '').split('/');
+                if (rates.length === 2) {
+                  txBps = Number(rates[0]) || txBps;
+                  rxBps = Number(rates[1]) || rxBps;
+                }
+                const bytes = (queueMatch.bytes || '').split('/');
+                if (bytes.length === 2) {
+                  upBytes = Number(bytes[0]) || upBytes;
+                  downBytes = Number(bytes[1]) || downBytes;
+                }
+              }
+
+              // The router is the source of truth for everything that is enforced on it. Local persisted
+              // state is only used for HA-side metadata (alias, time slots) or when a table could not be read.
+              const saved = this.persistedClientsState[ip] || (mac ? this.persistedClientsState[mac] : null) || {};
+              const isBlocked = addrListsOk ? blockedIps.has(ip) : Boolean(saved.is_blocked);
+              const routerGames = Array.from(routerDetectedBlockedGamesByIp.get(ip) || []);
+              const routerWebs = Array.from(routerDetectedBlockedWebsByIp.get(ip) || []);
+              const routerCustoms = Array.from(routerDetectedCustomDomainsByIp.get(ip) || []);
+
+              const blockedGames = fwOk ? routerGames : saved.blocked_games || [];
+              const blockedWebsites = fwOk ? routerWebs : saved.blocked_websites || [];
+              const customDomains = fwOk ? routerCustoms : saved.custom_blocked_domains || [];
+              const schedules = saved.schedules || [];
+              const alias = saved.alias || host;
+
+              let maxDown = saved.max_download_limit || 'Uncapped';
+              let maxUp = saved.max_upload_limit || 'Uncapped';
+              if (qsOk) {
+                if (queueMatch && queueMatch['max-limit'] && queueMatch['max-limit'] !== '0/0') {
+                  const [up, down] = String(queueMatch['max-limit']).split('/');
+                  maxUp = up || 'Uncapped';
+                  maxDown = down || 'Uncapped';
+                } else {
+                  maxDown = 'Uncapped';
+                  maxUp = 'Uncapped';
+                }
+              }
+
+              if (isBlocked) {
+                rxBps = 0;
+                txBps = 0;
+              }
+
+              return {
+                id: `c-${idx}`,
+                hostname: host,
+                alias,
+                ip_address: ip,
+                mac_address: mac,
+                vendor: 'Network Client',
+                interface: d.interface,
+                connection_type: 'ethernet',
+                status: isBlocked ? 'blocked' : (d.status === 'bound' ? 'active' : 'idle'),
+                rx_rate_bps: rxBps,
+                tx_rate_bps: txBps,
+                total_download_bytes: downBytes,
+                total_upload_bytes: upBytes,
+                uptime: d.lastSeen,
+                last_seen: 'Just now',
+                is_blocked: isBlocked,
+                block_method: 'firewall_address_list',
+                max_download_limit: isBlocked ? 'Blocked' : maxDown,
+                max_upload_limit: isBlocked ? 'Blocked' : maxUp,
+                queue_id: queueMatch ? idOf(queueMatch) : undefined,
+                schedules,
+                blocked_games: blockedGames,
+                blocked_websites: blockedWebsites,
+                custom_blocked_domains: customDomains,
+                dhcp_status: d.status,
+              };
+            });
+          }
+
+          if (Array.isArray(qs)) {
+            this.queues = qs.map((q: any) => {
+              const limits = (q['max-limit'] || '').split('/');
+              return {
+                id: q['.id'] || q.id,
+                name: q.name || '',
+                target: q.target || '',
+                max_limit_upload: limits[0] || '10M',
+                max_limit_download: limits[1] || '25M',
+                priority: Number(String(q.priority || '').split('/')[0] || 8),
+                burst_limit_upload: String(q['burst-limit'] || '').split('/')[0] || undefined,
+                burst_limit_download: String(q['burst-limit'] || '').split('/')[1] || undefined,
+                burst_threshold_upload: String(q['burst-threshold'] || '').split('/')[0] || undefined,
+                burst_threshold_download: String(q['burst-threshold'] || '').split('/')[1] || undefined,
+                burst_time: q['burst-time'] || undefined,
+                current_rate_upload_bps: Number(q.rate?.split('/')[0] || 0),
+                current_rate_download_bps: Number(q.rate?.split('/')[1] || 0),
+                total_bytes_upload: Number(q.bytes?.split('/')[0] || 0),
+                total_bytes_download: Number(q.bytes?.split('/')[1] || 0),
+                packet_drops: Number(q['total-packet-drops'] || 0),
+                disabled: q.disabled === 'true' || q.disabled === true,
+                dynamic: q.dynamic === 'true' || q.dynamic === true,
+                comment: q.comment || '',
+              };
+            });
+          }
+
+          if (Array.isArray(fw)) {
+            this.firewallRules = fw.map((r: any, idx: number) => ({
+              id: r['.id'] || `fw-${idx}`,
+              order: idx + 1,
+              chain: r.chain || 'forward',
+              action: r.action || 'accept',
+              src_address: r['src-address'],
+              dst_address: r['dst-address'],
+              src_address_list: r['src-address-list'],
+              dst_address_list: r['dst-address-list'],
+              protocol: r.protocol,
+              dst_port: r['dst-port'],
+              tls_host: r['tls-host'],
+              in_interface: r['in-interface'],
+              out_interface: r['out-interface'],
+              connection_state: r['connection-state'],
+              packets: Number(r.packets || 0),
+              bytes: Number(r.bytes || 0),
+              disabled: r.disabled === 'true' || r.disabled === true,
+              comment: r.comment || '',
+            }));
+          }
+
+          if (Array.isArray(sch)) {
+            this.schedules = sch.map((s: any) => ({
+              id: s['.id'] || s.id,
+              name: s.name,
+              start_date: s['start-date'] || '',
+              start_time: s['start-time'] || '',
+              interval: s.interval || '1d',
+              on_event: s['on-event'] || '',
+              run_count: Number(s['run-count'] || 0),
+              next_run: s['next-run'] || '',
+              disabled: s.disabled === 'true' || s.disabled === true,
+              comment: s.comment || '',
+            }));
+          }
+        } catch (subErr) {
+          // continue
+        }
+      }
+    } catch (err: any) {
+      // If current port/ssl failed, probe other candidate ports to auto-recover
+      try {
+        const adopted = await this.autoProbeAndAdoptWorkingPort();
+        if (adopted) {
+          const sys = await this.makeRouterOsRequest('/system/resource', { timeoutMs: 3000 });
+          if (sys) {
+            this.config.connected = true;
+            this.config.last_error = undefined;
+            this.config.last_sync = new Date().toISOString();
+            this.routerInfo.model = sys['board-name'] || sys.board_name || this.routerInfo.model;
+            this.routerInfo.routeros_version = sys.version || this.routerInfo.routeros_version;
+            return;
+          }
+        }
+      } catch {
+        // probe did not succeed
+      }
+
+      this.config.connected = false;
+      this.config.last_error = err.message || 'Cannot reach RouterOS REST API';
+    } finally {
+      this.isSyncing = false;
+    }
+  }
+
+  private async autoProbeAndAdoptWorkingPort(): Promise<boolean> {
+    if (!this.config.host) return false;
+    const host = this.config.host;
+    const candidates = [
+      { port: 80, ssl: false },
+      { port: 8443, ssl: true },
+      { port: 443, ssl: true },
+      { port: 8282, ssl: false },
+      { port: 8282, ssl: true },
+    ].filter((c) => c.port !== this.config.port || c.ssl !== this.config.use_ssl);
+
+    for (const c of candidates) {
+      try {
+        const open = await probePort(host, c.port, 1500);
+        if (!open) continue;
+        const res = await doRouterRequest(
+          {
+            host,
+            port: c.port,
+            username: this.config.username || 'admin',
+            password: this.config.password || '',
+            use_ssl: c.ssl,
+            allow_insecure_cert: true,
+          },
+          '/system/resource',
+          { timeoutMs: 2500 }
+        );
+        if (res.status === 200 || res.status === 401) {
+          console.log(`[MikroTik] Successfully auto-detected active RouterOS REST service on ${host}:${c.port} (SSL: ${c.ssl})! Adopting port.`);
+          this.config.port = c.port;
+          this.config.use_ssl = c.ssl;
+          return true;
+        }
+      } catch {
+        // ignore probe failure
+      }
+    }
+    return false;
+  }
+
+  private sanitizePayload(body: any): any {
+    if (!body || typeof body !== 'object') return body;
+    const cleaned: Record<string, any> = {};
+    for (const [k, v] of Object.entries(body)) {
+      if (v === undefined) continue;
+      // RouterOS v7 REST strictly requires booleans for boolean fields
+      if (k === 'disabled' || k === 'dynamic' || k === 'running' || k === 'invalid' || k === 'default') {
+        cleaned[k] = Boolean(v === true || v === 'yes' || v === 'true');
+      } else {
+        cleaned[k] = v;
+      }
+    }
+    return cleaned;
+  }
+
+  public async killClientConnections(ip: string): Promise<number> {
+    if (!this.config.host || !ip) return 0;
+    let killed = 0;
+    try {
+      // Query active connection tracking entries on RouterOS
+      const conns = await this.makeRouterOsRequest('/ip/firewall/connection', { timeoutMs: 3000 }).catch(() => null);
+      if (Array.isArray(conns)) {
+        const matching = conns.filter((c: any) => {
+          const src = String(c['src-address'] || '');
+          const dst = String(c['dst-address'] || '');
+          const replySrc = String(c['reply-src-address'] || '');
+          const replyDst = String(c['reply-dst-address'] || '');
+          return (
+            src.startsWith(`${ip}:`) ||
+            dst.startsWith(`${ip}:`) ||
+            replySrc.startsWith(`${ip}:`) ||
+            replyDst.startsWith(`${ip}:`)
+          );
+        });
+
+        for (const conn of matching.slice(0, 60)) {
+          const connId = conn['.id'] || conn.id;
+          if (connId) {
+            await this.makeRouterOsRequest(`/ip/firewall/connection/${connId}`, {
+              method: 'DELETE',
+              timeoutMs: 1500,
+            }).catch(() => {});
+            killed++;
+          }
+        }
+        if (killed > 0) {
+          console.log(`[MikroTik RouterOS] Flushed ${killed} active connection tracking entries for ${ip}`);
+        }
+      }
+    } catch (err: any) {
+      console.warn(`[MikroTik RouterOS] Could not flush connections for ${ip}:`, err.message);
+    }
+    return killed;
+  }
+
+  private async tryRouterOsCliFallback(endpoint: string, method: string, rawBody?: any): Promise<any> {
+    const body = this.sanitizePayload(rawBody);
+    try {
+      const clean = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+      const authConfig = {
+        host: this.config.host,
+        port: this.config.port || (this.config.use_ssl ? 8443 : 80),
+        username: this.config.username || 'admin',
+        password: this.config.password || '',
+        use_ssl: Boolean(this.config.use_ssl),
+        allow_insecure_cert: this.config.allow_insecure_cert ?? true,
+      };
+
+      if (method === 'PUT' || method === 'POST') {
+        // Strategy A: Direct POST /rest/path
+        const resA = await doRouterRequest(authConfig, clean, {
+          method: 'POST',
+          body,
+          timeoutMs: 4000,
+        }).catch(() => null);
+        if (resA && resA.status >= 200 && resA.status < 300) {
+          return resA.data;
+        }
+
+        // Strategy B: CLI POST /rest/path/add
+        const addEndpoint = `${clean}/add`;
+        const resB = await doRouterRequest(authConfig, addEndpoint, {
+          method: 'POST',
+          body,
+          timeoutMs: 4000,
+        }).catch(() => null);
+        if (resB && resB.status >= 200 && resB.status < 300) {
+          console.log(`[MikroTik CLI Fallback] Success on POST ${addEndpoint}`);
+          return resB.data;
+        }
+      }
+
+      if (method === 'DELETE') {
+        const lastSlash = clean.lastIndexOf('/');
+        if (lastSlash > 0) {
+          const parent = clean.substring(0, lastSlash);
+          const itemId = clean.substring(lastSlash + 1);
+          const removeEndpoint = `${parent}/remove`;
+          const res = await doRouterRequest(authConfig, removeEndpoint, {
+            method: 'POST',
+            body: { '.id': itemId, numbers: itemId },
+            timeoutMs: 4000,
+          }).catch(() => null);
+          if (res && res.status >= 200 && res.status < 300) {
+            console.log(`[MikroTik CLI Fallback] Success on POST ${removeEndpoint} for ${itemId}`);
+            return res.data;
+          }
+        }
+      }
+
+      if (method === 'PATCH') {
+        const lastSlash = clean.lastIndexOf('/');
+        if (lastSlash > 0) {
+          const parent = clean.substring(0, lastSlash);
+          const itemId = clean.substring(lastSlash + 1);
+
+          // Strategy A: POST /rest/path with ID
+          const resA = await doRouterRequest(authConfig, clean, {
+            method: 'POST',
+            body: { '.id': itemId, ...body },
+            timeoutMs: 4000,
+          }).catch(() => null);
+          if (resA && resA.status >= 200 && resA.status < 300) {
+            return resA.data;
+          }
+
+          // Strategy B: POST /rest/parent/set
+          const setEndpoint = `${parent}/set`;
+          const resB = await doRouterRequest(authConfig, setEndpoint, {
+            method: 'POST',
+            body: { '.id': itemId, numbers: itemId, ...(body || {}) },
+            timeoutMs: 4000,
+          }).catch(() => null);
+          if (resB && resB.status >= 200 && resB.status < 300) {
+            console.log(`[MikroTik CLI Fallback] Success on POST ${setEndpoint} for ${itemId}`);
+            return resB.data;
+          }
+        }
+      }
+    } catch (e: any) {
+      console.warn(`[MikroTik CLI Fallback] Fallback execution failed: ${e.message}`);
+    }
+    return null;
+  }
+
+  // --- Real RouterOS REST API communication (RouterOS v7) ---
+  public async makeRouterOsRequest(
+    endpoint: string,
+    options: { method?: string; body?: any; timeoutMs?: number } = {}
+  ): Promise<any> {
+    if (!this.config.host) {
+      throw new Error('Router host IP is not configured');
+    }
+
+    const method = (options.method || 'GET').toUpperCase();
+    const sanitizedBody = this.sanitizePayload(options.body);
+
+    try {
+      const res = await doRouterRequest(
+        {
+          host: this.config.host,
+          port: this.config.port || (this.config.use_ssl ? 8443 : 80),
+          username: this.config.username || 'admin',
+          password: this.config.password || '',
+          use_ssl: this.config.use_ssl ?? true,
+          allow_insecure_cert: this.config.allow_insecure_cert ?? true,
+        },
+        endpoint,
+        {
+          ...options,
+          method,
+          body: sanitizedBody,
+        }
+      );
+
+      if (res.status >= 200 && res.status < 300) {
+        this.config.connected = true;
+        this.config.last_error = undefined;
+        this.config.last_sync = new Date().toISOString();
+        return res.data;
+      }
+
+      // If standard REST returned error (400, 404, 405), invoke multi-strategy CLI fallback
+      if (res.status === 404 || res.status === 405 || res.status === 400) {
+        const fallback = await this.tryRouterOsCliFallback(endpoint, method, sanitizedBody);
+        if (fallback !== null) {
+          this.config.connected = true;
+          this.config.last_error = undefined;
+          this.config.last_sync = new Date().toISOString();
+          return fallback;
+        }
+      }
+
+      const errDetail = typeof res.data === 'object' ? JSON.stringify(res.data) : res.raw || res.statusText;
+      throw new Error(`RouterOS HTTP ${res.status}: ${errDetail}`);
+    } catch (err: any) {
+      if (method === 'PUT' || method === 'POST' || method === 'DELETE' || method === 'PATCH') {
+        const fallback = await this.tryRouterOsCliFallback(endpoint, method, sanitizedBody).catch(() => null);
+        if (fallback !== null) {
+          this.config.connected = true;
+          this.config.last_error = undefined;
+          this.config.last_sync = new Date().toISOString();
+          return fallback;
+        }
+      }
+      throw err;
+    }
+  }
+
+  // --- Public API Methods ---
+
+  public getConfig(): RouterConnectionConfig {
+    return {
+      ...this.config,
+      password: this.config.password ? '••••••••' : '',
+    };
+  }
+
+  /** Settings that must survive a restart. Includes the real password (file is private to the add-on). */
+  public getPersistableConfig() {
+    return {
+      host: this.config.host,
+      port: this.config.port,
+      username: this.config.username,
+      password: this.config.password || '',
+      use_ssl: Boolean(this.config.use_ssl),
+      allow_insecure_cert: this.config.allow_insecure_cert ?? true,
+      poll_interval_ms: this.config.poll_interval_ms,
+    };
+  }
+
+  public async setConfig(newConfig: Partial<RouterConnectionConfig>) {
+    if (newConfig.host !== undefined) this.config.host = newConfig.host;
+    if (newConfig.port !== undefined) this.config.port = Number(newConfig.port);
+    if (newConfig.username !== undefined) this.config.username = newConfig.username;
+    if (newConfig.password !== undefined && newConfig.password !== '••••••••') {
+      this.config.password = newConfig.password;
+    }
+    if (newConfig.use_ssl !== undefined) this.config.use_ssl = Boolean(newConfig.use_ssl);
+    if (newConfig.allow_insecure_cert !== undefined) this.config.allow_insecure_cert = Boolean(newConfig.allow_insecure_cert);
+    if (newConfig.poll_interval_ms !== undefined) this.config.poll_interval_ms = Number(newConfig.poll_interval_ms);
+    this.config.mode = 'real';
+
+    try {
+      const sysRes = await this.makeRouterOsRequest('/system/resource', { timeoutMs: 4000 });
+      this.config.connected = true;
+      this.config.last_error = undefined;
+      this.config.last_sync = new Date().toISOString();
+      if (sysRes) {
+        this.routerInfo.model = sysRes['board-name'] || sysRes.board_name || this.routerInfo.model;
+        this.routerInfo.routeros_version = sysRes.version || this.routerInfo.routeros_version;
+        this.routerInfo.cpu_load_percent = Number(sysRes['cpu-load'] || sysRes.cpu_load || 15);
+      }
+    } catch (err: any) {
+      this.config.connected = false;
+      this.config.last_error = err.message;
+    }
+
+    return this.getConfig();
+  }
+
+  public async testConnection(testCfg: Partial<RouterConnectionConfig>) {
+    const host = (testCfg.host || this.config.host || '').trim();
+    const port = Number(testCfg.port || this.config.port || (testCfg.use_ssl ? 8443 : 80));
+    const username = (testCfg.username || this.config.username || 'admin').trim();
+    const password = testCfg.password !== undefined && testCfg.password !== '••••••••' ? testCfg.password : this.config.password;
+    const use_ssl = testCfg.use_ssl !== undefined ? Boolean(testCfg.use_ssl) : (this.config.use_ssl ?? true);
+    const allow_insecure_cert = testCfg.allow_insecure_cert !== undefined ? Boolean(testCfg.allow_insecure_cert) : true;
+
+    if (!host) {
+      return {
+        success: false,
+        message: 'Please provide a valid Router IP or Hostname.',
+      };
+    }
+
+    const isPrivate = isPrivateLanIp(host);
+    const testedUrl = `${use_ssl ? 'https' : 'http'}://${host}:${port}/rest/system/resource`;
+
+    // 1. Check TCP reachability first
+    const isTcpOpen = await probePort(host, port, 3000);
+
+    // 2. Perform REST request with self-signed cert support
+    try {
+      const res = await doRouterRequest(
+        { host, port, username, password, use_ssl, allow_insecure_cert },
+        '/system/resource',
+        { timeoutMs: 5000 }
+      );
+
+      if (res.status === 200 && res.data) {
+        const board = res.data['board-name'] || res.data.board_name || res.data.platform || 'MikroTik RouterBOARD';
+        const version = res.data.version || 'v7';
+        const cpu = res.data['cpu-load'] || res.data.cpu_load || 0;
+        return {
+          success: true,
+          message: `Connected successfully to ${board} running RouterOS ${version} (CPU: ${cpu}%)!`,
+          data: res.data,
+          diagnosis: {
+            is_private_ip: isPrivate,
+            tcp_open: true,
+            tested_url: testedUrl,
+            status_code: 200,
+          },
+        };
+      }
+
+      if (res.status === 401) {
+        return {
+          success: false,
+          message: `HTTP 401 Unauthorized: RouterOS rejected username '${username}' or password. Please verify credentials in Winbox > System > Users.`,
+          diagnosis: {
+            is_private_ip: isPrivate,
+            tcp_open: true,
+            tested_url: testedUrl,
+            status_code: 401,
+            recommendation: 'Check username and password. By default, admin has no password or a custom password.',
+            actionable_solutions: [
+              {
+                title: 'Check MikroTik User Credentials',
+                badge: 'System > Users',
+                steps: [
+                  'Open Winbox and connect to your router.',
+                  'Navigate to System > Users.',
+                  `Confirm user '${username}' exists and check assigned group policies (must have read and api / rest policies).`,
+                  'Ensure the password matches what you entered.',
+                ],
+              },
+            ],
+          },
+        };
+      }
+
+      if (res.status === 404) {
+        return {
+          success: false,
+          message: `HTTP 404 Not Found: Connected to web server at ${host}:${port}, but '/rest' API endpoint does not exist. Ensure your MikroTik is running RouterOS v7.1 or newer.`,
+          diagnosis: {
+            is_private_ip: isPrivate,
+            tcp_open: true,
+            tested_url: testedUrl,
+            status_code: 404,
+            recommendation: 'Upgrade RouterBOARD to RouterOS v7.1+ in System > Packages.',
+            actionable_solutions: [
+              {
+                title: 'Verify RouterOS Version',
+                badge: 'RouterOS v7+',
+                steps: [
+                  'RouterOS v6 does not include the modern REST API.',
+                  'Open Winbox > System > Packages and check version (must be v7.1 or newer).',
+                ],
+              },
+            ],
+          },
+        };
+      }
+
+      return {
+        success: false,
+        message: `RouterOS replied with HTTP ${res.status}: ${res.raw || res.statusText}`,
+        diagnosis: {
+          is_private_ip: isPrivate,
+          tcp_open: isTcpOpen,
+          tested_url: testedUrl,
+          status_code: res.status,
+        },
+      };
+    } catch (err: any) {
+      // If primary port failed, scan other common ports to give an actionable solution
+      const candidatePorts = [
+        { port: 8443, ssl: true, label: '8443 (www-ssl)' },
+        { port: 443, ssl: true, label: '443 (HTTPS)' },
+        { port: 80, ssl: false, label: '80 (HTTP)' },
+        { port: 8282, ssl: false, label: '8282 (www)' },
+      ].filter((p) => p.port !== port);
+
+      const probeResults = await Promise.all(
+        candidatePorts.map(async (c) => ({
+          ...c,
+          open: await probePort(host, c.port, 1500),
+        }))
+      );
+
+      const openCandidate = probeResults.find((c) => c.open);
+
+      let serviceHints: string[] = [];
+      let actionableSolutions: any[] = [];
+
+      if (openCandidate) {
+        serviceHints.push(
+          `Port ${port} is unreachable, but Port ${openCandidate.port} (${openCandidate.label}) IS OPEN and responding on ${host}!`
+        );
+        actionableSolutions.push({
+          title: `Switch to Detected Open Port ${openCandidate.port}`,
+          badge: openCandidate.ssl ? 'HTTPS (SSL)' : 'HTTP',
+          steps: [
+            `Change Port to ${openCandidate.port}.`,
+            openCandidate.ssl ? 'Ensure "Use HTTPS / SSL" is checked.' : 'Uncheck "Use HTTPS / SSL" (HTTP mode).',
+            'Click Test Connection again to verify.',
+          ],
+        });
+      } else {
+        serviceHints.push(
+          `No standard RouterOS web ports (8443, 443, 80, 8282) responded on '${host}'.`
+        );
+        if (isPrivate) {
+          serviceHints.push(
+            `'${host}' is an internal LAN address. In Home Assistant, this add-on runs directly inside your local network. Verify the router IP address matches your MikroTik gateway.`
+          );
+        }
+      }
+
+      actionableSolutions.push({
+        title: 'Check Winbox IP > Services',
+        badge: 'RouterOS Configuration',
+        steps: [
+          'In Winbox, go to IP > Services.',
+          `Ensure either 'www-ssl' (port 8443 or 443) or 'www' (port 80 or 8282) is ENABLED (not disabled).`,
+          'Check that "Available From" does not restrict connections from Home Assistant subnet.',
+        ],
+      });
+
+      return {
+        success: false,
+        message: `Connection failed to ${host}:${port} (${err.message || 'Network unreachable'})`,
+        diagnosis: {
+          is_private_ip: isPrivate,
+          tcp_open: isTcpOpen,
+          tested_url: testedUrl,
+          host,
+          port,
+          use_ssl,
+          service_hints: serviceHints,
+          actionable_solutions: actionableSolutions,
+        },
+      };
+    }
+  }
+
+  public getRouterInfo(): RouterInfo {
+    return this.routerInfo;
+  }
+
+  public getInterfaces(): InterfaceTraffic[] {
+    return this.interfaces;
+  }
+
+  public getThroughputHistory(): ThroughputHistoryPoint[] {
+    return this.throughputHistory;
+  }
+
+  public getClients(): ClientDevice[] {
+    return this.clients;
+  }
+
+  public ensureClientExists(ipOrMac: string): ClientDevice {
+    const clean = ipOrMac.trim();
+    let client = this.clients.find(
+      (c) =>
+        c.ip_address === clean ||
+        (c.mac_address && c.mac_address.toLowerCase() === clean.toLowerCase())
+    );
+    if (!client) {
+      const isIp = clean.includes('.');
+      const isMac = clean.includes(':');
+      const ip = isIp ? clean : '';
+      const mac = isMac ? clean : '';
+      const defaultHost = ip ? `Device-${ip.split('.').slice(-1)[0]}` : `Device-${clean.slice(-4)}`;
+
+      // Check if we have saved state for this device
+      const saved =
+        this.persistedClientsState[clean] ||
+        (ip ? this.persistedClientsState[ip] : null) ||
+        (mac ? this.persistedClientsState[mac] : null) ||
+        {};
+
+      client = {
+        id: `c-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        hostname: defaultHost,
+        alias: saved.alias || defaultHost,
+        ip_address: ip || clean,
+        mac_address: mac,
+        vendor: 'Network Device',
+        interface: 'bridge',
+        connection_type: 'ethernet',
+        status: saved.is_blocked ? 'blocked' : 'active',
+        rx_rate_bps: 0,
+        tx_rate_bps: 0,
+        total_download_bytes: 0,
+        total_upload_bytes: 0,
+        uptime: 'Active',
+        last_seen: 'Just now',
+        is_blocked: Boolean(saved.is_blocked),
+        block_method: 'firewall_address_list',
+        max_download_limit: saved.max_download_limit || 'Uncapped',
+        max_upload_limit: saved.max_upload_limit || 'Uncapped',
+        schedules: saved.schedules || [],
+        blocked_games: saved.blocked_games || [],
+        blocked_websites: saved.blocked_websites || [],
+        custom_blocked_domains: saved.custom_blocked_domains || [],
+        dhcp_status: 'bound',
+      };
+      this.clients.push(client);
+    }
+    return client;
+  }
+
+  public async blockClient(ipOrMac: string, block: boolean) {
+    const client = this.ensureClientExists(ipOrMac);
+    const ip = client.ip_address;
+    if (!ip) throw new Error('Client has no IP address');
+    const failures: string[] = [];
+
+    if (this.config.host) {
+      if (block) {
+        console.log(`[MikroTik RouterOS] Enforcing complete cutoff for client ${ip}...`);
+        // Make sure the list-based drop rule exists, then add the device to the list (the core requirement)
+        await this.ensureBaseDropRule();
+        const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 });
+        const alreadyInList =
+          Array.isArray(addrLists) &&
+          addrLists.some((a: any) => a.list === 'ha_blocked_users' && a.address === ip);
+        if (!alreadyInList) {
+          await this.makeRouterOsRequest('/ip/firewall/address-list', {
+            method: 'PUT',
+            body: {
+              list: 'ha_blocked_users',
+              address: ip,
+              disabled: false,
+              comment: `Blocked via Home Assistant: ${client.alias || client.hostname}`,
+            },
+          });
+        }
+
+        // Extra direct drop rules (idempotent: skip ones that already exist)
+        const existing = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 }).catch(() => null);
+        const haveComments = new Set<string>(
+          Array.isArray(existing) ? existing.map((r: any) => String(r.comment || '')) : []
+        );
+        const cutoffRules: Array<Record<string, any>> = [
+          { chain: 'forward', action: 'drop', 'src-address': ip, comment: `HA Cutoff [${ip}]: Block Outbound Forward` },
+          { chain: 'forward', action: 'drop', 'dst-address': ip, comment: `HA Cutoff [${ip}]: Block Inbound Forward` },
+          { chain: 'input', action: 'drop', 'src-address': ip, comment: `HA Cutoff [${ip}]: Block Input DNS` },
+        ];
+        await this.runWithFirewallLock(async () => {
+          for (const rule of cutoffRules) {
+            if (haveComments.has(rule.comment)) continue;
+            await this.tryRouter(failures, rule.comment, () =>
+              this.addFirewallFilterRuleToRouter({ ...rule, disabled: false })
+            );
+          }
+        });
+        await this.killClientConnections(ip);
+      } else {
+        console.log(`[MikroTik RouterOS] Unblocking client ${ip}...`);
+        const existingRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 });
+        if (Array.isArray(existingRules)) {
+          const cutoffRules = existingRules.filter((r: any) => {
+            const c = String(r.comment || '');
+            return (
+              c.includes(`HA Cutoff [${ip}]`) ||
+              c.includes(`Client Cutoff [${ip}]`) ||
+              (r['src-address'] === ip && c.includes('Cutoff'))
+            );
+          });
+          for (const r of cutoffRules) {
+            const ruleId = idOf(r);
+            if (ruleId) await this.tryRouter(failures, `remove ${r.comment}`, () => this.deleteRouterItem('/ip/firewall/filter', ruleId));
+          }
+        }
+        const addrLists = await this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3000 });
+        if (Array.isArray(addrLists)) {
+          for (const m of addrLists.filter((a: any) => a.list === 'ha_blocked_users' && a.address === ip)) {
+            const entryId = idOf(m);
+            if (entryId) await this.tryRouter(failures, `remove ${ip} from ha_blocked_users`, () => this.deleteRouterItem('/ip/firewall/address-list', entryId));
+          }
+        }
+      }
+    }
+
+    if (failures.length > 0) {
+      await this.refreshNow();
+      throw new Error(`RouterOS did not accept ${failures.length} change(s): ${failures.join('; ')}`);
+    }
+
+    if (!this.persistedClientsState[ip]) this.persistedClientsState[ip] = {};
+    this.persistedClientsState[ip].is_blocked = block;
+    this.savePersistedState();
+
+    client.is_blocked = block;
+    client.status = block ? 'blocked' : 'active';
+    await this.refreshNow();
+    return this.clients.find((c) => c.ip_address === ip) || client;
+  }
+
+  private static readonly SPEED_RE = /^\d+(\.\d+)?\s*[kKmMgG]?$/;
+
+  public async setClientSpeedLimit(ipOrMac: string, maxDownload: string, maxUpload: string) {
+    const client = this.ensureClientExists(ipOrMac);
+    const ip = client.ip_address;
+    if (!ip) throw new Error('Client has no IP address');
+
+    const isUncapped = (v: string) => !v || v === 'Uncapped' || v === '0';
+    const norm = (v: string) => (isUncapped(v) ? '0' : String(v).replace(/\s+/g, ''));
+    for (const v of [maxDownload, maxUpload]) {
+      if (!isUncapped(v) && !MikroTikService.SPEED_RE.test(String(v))) {
+        throw new Error(`Invalid speed "${v}". Use values like 5M, 512k or Uncapped.`);
+      }
+    }
+
+    const targetSubnet = `${ip}/32`;
+    const queueName = `Limit-${ip.replace(/\./g, '_')}`;
+
+    if (this.config.host) {
+      const routerQueues = await this.makeRouterOsRequest('/queue/simple', { timeoutMs: 3000 });
+      const existingRouterQueue = Array.isArray(routerQueues)
+        ? routerQueues.find(
+            (q: any) =>
+              !String(q.name || '').startsWith('HA-Throttle-') &&
+              (targetMatchesIp(q.target, ip) || q.name === queueName)
+          )
+        : null;
+
+      if (isUncapped(maxDownload) && isUncapped(maxUpload)) {
+        const qId = idOf(existingRouterQueue);
+        if (qId) {
+          console.log(`[MikroTik RouterOS] Deleting speed limit queue ${qId} for ${ip}`);
+          await this.deleteRouterItem('/queue/simple', qId);
+        }
+      } else {
+        const maxLimit = `${norm(maxUpload)}/${norm(maxDownload)}`;
+        const qId = idOf(existingRouterQueue);
+        if (qId) {
+          console.log(`[MikroTik RouterOS] Updating speed limit queue ${qId} to ${maxLimit}`);
+          await this.makeRouterOsRequest(`/queue/simple/${qId}`, {
+            method: 'PATCH',
+            body: { 'max-limit': maxLimit, disabled: false },
+          });
+        } else {
+          console.log(`[MikroTik RouterOS] Creating speed limit queue for ${ip} (${maxLimit})`);
+          await this.makeRouterOsRequest('/queue/simple', {
+            method: 'PUT',
+            body: {
+              name: queueName,
+              target: targetSubnet,
+              'max-limit': maxLimit,
+              disabled: false,
+              comment: `Speed limit for ${client.alias || client.hostname} via Home Assistant`,
+            },
+          });
+        }
+      }
+    }
+
+    if (!this.persistedClientsState[ip]) this.persistedClientsState[ip] = {};
+    this.persistedClientsState[ip].max_download_limit = isUncapped(maxDownload) ? 'Uncapped' : maxDownload;
+    this.persistedClientsState[ip].max_upload_limit = isUncapped(maxUpload) ? 'Uncapped' : maxUpload;
+    this.savePersistedState();
+
+    await this.refreshNow();
+    const fresh = this.clients.find((c) => c.ip_address === ip) || client;
+    return { client: fresh, queue: this.queues.find((q) => targetMatchesIp(q.target, ip)) };
+  }
+
+  // --- Multiple Restriction Time Slots ---
+  public async setClientSchedules(ipOrMac: string, schedules: RestrictionTimeSlot[]) {
+    const client = this.ensureClientExists(ipOrMac);
+    const ip = client.ip_address;
+    if (!Array.isArray(schedules)) throw new Error('schedules must be an array');
+
+    if (!this.persistedClientsState[ip]) this.persistedClientsState[ip] = {};
+    this.persistedClientsState[ip].schedules = schedules;
+    this.savePersistedState();
+    client.schedules = schedules;
+
+    // Apply immediately instead of waiting for the next enforcement pass
+    if (this.config.host) {
+      await this.enforceSchedules(true);
+      await this.refreshNow();
+    }
+    return this.clients.find((c) => c.ip_address === ip) || client;
+  }
+
+  /**
+   * Enforces per-device time slots on the router itself. Runs every 15 s and right after a save.
+   *  - block_all : device is put in the `ha_blocked_users` list (tagged "HA Schedule") while the window is open
+   *  - throttle  : a `HA-Throttle-<ip>` simple queue is created/updated while the window is open
+   * Entries created here are removed again when the window closes; manual blocks are never touched.
+   */
+  public async enforceSchedules(force = false): Promise<void> {
+    if (this.isEnforcingSchedules && !force) return;
+    if (!this.config.host || (!force && !this.config.connected)) return;
+    this.isEnforcingSchedules = true;
+    try {
+      const now = new Date();
+      const cur = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+      const day = this.getDayOfWeek(now);
+
+      const [addr, qs] = await Promise.all([
+        this.makeRouterOsRequest('/ip/firewall/address-list', { timeoutMs: 3500 }),
+        this.makeRouterOsRequest('/queue/simple', { timeoutMs: 3500 }),
+      ]);
+      if (!Array.isArray(addr) || !Array.isArray(qs)) return;
+
+      let baseRuleChecked = false;
+      for (const [ip, st] of Object.entries(this.persistedClientsState)) {
+        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) continue;
+        const slots = st.schedules || [];
+        const active = slots.find(
+          (s) => s.enabled && s.days.includes(day) && this.isTimeInWindow(s.start_time, s.end_time, cur)
+        );
+
+        // --- block_all ---
+        const listEntries = addr.filter((a: any) => a.list === 'ha_blocked_users' && a.address === ip);
+        const scheduleEntries = listEntries.filter((a: any) => String(a.comment || '').startsWith('HA Schedule'));
+        if (active?.action === 'block_all') {
+          if (listEntries.length === 0) {
+            if (!baseRuleChecked) {
+              await this.ensureBaseDropRule();
+              baseRuleChecked = true;
+            }
+            console.log(`[MikroTik Schedule] Blocking ${ip} for window "${active.name}"`);
+            await this.makeRouterOsRequest('/ip/firewall/address-list', {
+              method: 'PUT',
+              body: { list: 'ha_blocked_users', address: ip, disabled: false, comment: `HA Schedule: ${active.name}` },
+            });
+            await this.killClientConnections(ip);
+          }
+        } else {
+          for (const e of scheduleEntries) {
+            const id = idOf(e);
+            if (id) {
+              console.log(`[MikroTik Schedule] Window closed, unblocking ${ip}`);
+              await this.deleteRouterItem('/ip/firewall/address-list', id);
+            }
+          }
+        }
+
+        // --- throttle ---
+        const throttleName = `HA-Throttle-${ip.replace(/\./g, '_')}`;
+        const throttleQ = qs.find((q: any) => q.name === throttleName);
+        if (active?.action === 'throttle') {
+          const speed = active.throttle_speed || '1M/512k';
+          const maxLimit = speed.includes('/') ? speed : `${speed}/${speed}`;
+          if (!throttleQ) {
+            console.log(`[MikroTik Schedule] Throttling ${ip} to ${maxLimit} for window "${active.name}"`);
+            await this.makeRouterOsRequest('/queue/simple', {
+              method: 'PUT',
+              body: {
+                name: throttleName,
+                target: `${ip}/32`,
+                'max-limit': maxLimit,
+                priority: '1/1',
+                comment: `HA Schedule throttle: ${active.name}`,
+              },
+            });
+          } else if (throttleQ['max-limit'] !== maxLimit) {
+            await this.makeRouterOsRequest(`/queue/simple/${idOf(throttleQ)}`, {
+              method: 'PATCH',
+              body: { 'max-limit': maxLimit },
+            });
+          }
+        } else if (throttleQ) {
+          const id = idOf(throttleQ);
+          if (id) await this.deleteRouterItem('/queue/simple', id);
+        }
+      }
+    } catch (err: any) {
+      console.warn('[MikroTik Schedule] Enforcement pass failed:', errMsg(err));
+    } finally {
+      this.isEnforcingSchedules = false;
+    }
+  }
+
+  /**
+   * Replace every `<prefix> [ip]` rule of a client with the desired set. Rules marked `optional`
+   * (tls-host matching, which not every RouterOS build accepts) only produce warnings; any other
+   * failure is returned so the caller can tell the user the router did not accept the change.
+   */
+  private async applyShield(
+    ip: string,
+    prefix: 'Game Shield' | 'Web Shield',
+    legacyPrefix: 'HA Game' | 'HA Web',
+    entries: Array<{ list: string; address: string; comment: string }>,
+    rules: Array<{ body: Record<string, any>; optional?: boolean }>
+  ): Promise<string[]> {
+    const failures: string[] = [];
+    await this.runWithFirewallLock(async () => {
+      const existing = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 });
+      const old = (Array.isArray(existing) ? existing : []).filter((r: any) => {
+        const c = String(r.comment || '');
+        return c.includes(`${prefix} [${ip}]`) || c.includes(`${legacyPrefix} [${ip}]`);
+      });
+      for (const r of old) {
+        const id = idOf(r);
+        if (id) await this.tryRouter(failures, `remove "${r.comment}"`, () => this.deleteRouterItem('/ip/firewall/filter', id));
+      }
+
+      for (const e of entries) {
+        await this.tryRouter(failures, `address-list ${e.list}/${e.address}`, () =>
+          this.makeRouterOsRequest('/ip/firewall/address-list', {
+            method: 'PUT',
+            body: { list: e.list, address: e.address, disabled: false, comment: e.comment },
+          })
+        );
+      }
+
+      for (const rule of rules) {
+        const sink: string[] = [];
+        await this.tryRouter(sink, String(rule.body.comment), () => this.addFirewallFilterRuleToRouter(rule.body));
+        if (sink.length > 0) {
+          if (rule.optional) console.warn('[MikroTik RouterOS] Optional rule skipped:', sink[0]);
+          else failures.push(...sink);
+        }
+      }
+
+      if (rules.length > 0) await this.killClientConnections(ip);
+    });
+    return failures;
+  }
+
+  // --- Popular Games Blocking ---
+  public async setClientBlockedGames(ipOrMac: string, gameIds: string[]) {
+    const client = this.ensureClientExists(ipOrMac);
+    const ip = client.ip_address;
+    if (!ip) throw new Error('Client has no IP address');
+    gameIds = Array.isArray(gameIds) ? gameIds : [];
+
+    if (this.config.host) {
+      const entries: Array<{ list: string; address: string; comment: string }> = [];
+      const rules: Array<{ body: Record<string, any>; optional?: boolean }> = [];
+      const base = { chain: 'forward', action: 'drop', 'src-address': ip, disabled: false };
+
+      for (const gId of gameIds) {
+        const game = POPULAR_GAMES.find((g) => g.id === gId);
+        if (!game) continue;
+        const listName = `ha_game_${game.id}`;
+        for (const domain of (game.domains || []).slice(0, 3)) {
+          entries.push({ list: listName, address: domain, comment: `Game Shield: ${game.name} (${domain})` });
+        }
+        rules.push({
+          body: { ...base, 'dst-address-list': listName, comment: `Game Shield [${ip}]: Block ${game.name} IP List` },
+        });
+        for (const domain of (game.domains || []).slice(0, 2)) {
+          rules.push({
+            optional: true,
+            body: { ...base, protocol: 'tcp', 'dst-port': '443', 'tls-host': `*.${domain}`, comment: `Game Shield [${ip}]: Block ${game.name} (*.${domain})` },
+          });
+          rules.push({
+            optional: true,
+            body: { ...base, protocol: 'tcp', 'dst-port': '443', 'tls-host': domain, comment: `Game Shield [${ip}]: Block ${game.name} (${domain})` },
+          });
+        }
+        if (game.id === 'roblox') {
+          rules.push({ body: { ...base, protocol: 'udp', 'dst-port': '49152-65535', comment: `Game Shield [${ip}]: Block Roblox UDP Ports` } });
+        } else if (game.id === 'minecraft') {
+          rules.push({ body: { ...base, protocol: 'tcp', 'dst-port': '25565', comment: `Game Shield [${ip}]: Block Minecraft Java 25565` } });
+          rules.push({ body: { ...base, protocol: 'udp', 'dst-port': '19132', comment: `Game Shield [${ip}]: Block Minecraft Bedrock 19132` } });
+        }
+      }
+      if (rules.length > 0) {
+        rules.push({ body: { ...base, protocol: 'udp', 'dst-port': '443', comment: `Game Shield [${ip}]: Block QUIC Bypass` } });
+      }
+
+      console.log(`[MikroTik RouterOS] Syncing game block rules for ${ip}:`, gameIds);
+      const failures = await this.applyShield(ip, 'Game Shield', 'HA Game', entries, rules);
+      if (failures.length > 0) {
+        await this.refreshNow();
+        throw new Error(`RouterOS did not accept ${failures.length} game rule(s): ${failures.slice(0, 3).join('; ')}`);
+      }
+    }
+
+    if (!this.persistedClientsState[ip]) this.persistedClientsState[ip] = {};
+    this.persistedClientsState[ip].blocked_games = gameIds;
+    this.savePersistedState();
+    client.blocked_games = gameIds;
+
+    await this.refreshNow();
+    return this.clients.find((c) => c.ip_address === ip) || client;
+  }
+
+  // --- Popular Websites & Custom Domains Blocking ---
+  public async setClientBlockedWebsites(ipOrMac: string, websiteIds: string[], customDomains: string[]) {
+    const client = this.ensureClientExists(ipOrMac);
+    const ip = client.ip_address;
+    if (!ip) throw new Error('Client has no IP address');
+    websiteIds = Array.isArray(websiteIds) ? websiteIds : [];
+    customDomains = (Array.isArray(customDomains) ? customDomains : [])
+      .map((d) => String(d).trim().toLowerCase())
+      .filter((d) => d.length > 0);
+    for (const d of customDomains) {
+      if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(d)) throw new Error(`Invalid domain "${d}"`);
+    }
+
+    if (this.config.host) {
+      const entries: Array<{ list: string; address: string; comment: string }> = [];
+      const rules: Array<{ body: Record<string, any>; optional?: boolean }> = [];
+      const base = { chain: 'forward', action: 'drop', 'src-address': ip, disabled: false };
+
+      if (websiteIds.length > 0 || customDomains.length > 0) {
+        rules.push({ body: { ...base, protocol: 'udp', 'dst-port': '443', comment: `Web Shield [${ip}]: Block QUIC Bypass` } });
+      }
+
+      for (const wId of websiteIds) {
+        const site = POPULAR_WEBSITES.find((s) => s.id === wId);
+        if (!site) continue;
+        const listName = `ha_web_${site.id}`;
+        for (const domain of (site.domains || []).slice(0, 3)) {
+          entries.push({ list: listName, address: domain, comment: `Web Shield: ${site.name} (${domain})` });
+        }
+        rules.push({ body: { ...base, 'dst-address-list': listName, comment: `Web Shield [${ip}]: Block ${site.name} IP List` } });
+        for (const domain of (site.domains || []).slice(0, 2)) {
+          rules.push({
+            optional: true,
+            body: { ...base, protocol: 'tcp', 'dst-port': '443', 'tls-host': `*.${domain}`, comment: `Web Shield [${ip}]: Block ${site.name} (*.${domain})` },
+          });
+          rules.push({
+            optional: true,
+            body: { ...base, protocol: 'tcp', 'dst-port': '443', 'tls-host': domain, comment: `Web Shield [${ip}]: Block ${site.name} (${domain})` },
+          });
+        }
+      }
+
+      const customListName = `ha_web_custom_${ip.replace(/\./g, '_')}`;
+      for (const clean of customDomains) {
+        entries.push({ list: customListName, address: clean, comment: `Web Shield: Custom (${clean})` });
+        rules.push({
+          optional: true,
+          body: { ...base, protocol: 'tcp', 'dst-port': '443', 'tls-host': `*.${clean}`, comment: `Web Shield [${ip}]: Custom (*.${clean})` },
+        });
+        rules.push({
+          optional: true,
+          body: { ...base, protocol: 'tcp', 'dst-port': '443', 'tls-host': clean, comment: `Web Shield [${ip}]: Custom (${clean})` },
+        });
+      }
+      if (customDomains.length > 0) {
+        rules.push({ body: { ...base, 'dst-address-list': customListName, comment: `Web Shield [${ip}]: Custom Domains List` } });
+      }
+
+      console.log(`[MikroTik RouterOS] Syncing website filters for ${ip}:`, websiteIds, customDomains);
+      const failures = await this.applyShield(ip, 'Web Shield', 'HA Web', entries, rules);
+      if (failures.length > 0) {
+        await this.refreshNow();
+        throw new Error(`RouterOS did not accept ${failures.length} website rule(s): ${failures.slice(0, 3).join('; ')}`);
+      }
+    }
+
+    if (!this.persistedClientsState[ip]) this.persistedClientsState[ip] = {};
+    this.persistedClientsState[ip].blocked_websites = websiteIds;
+    this.persistedClientsState[ip].custom_blocked_domains = customDomains;
+    this.savePersistedState();
+    client.blocked_websites = websiteIds;
+    client.custom_blocked_domains = customDomains;
+
+    await this.refreshNow();
+    return this.clients.find((c) => c.ip_address === ip) || client;
+  }
+
+  // --- Combined Content Filter Sync (Games + Websites + Custom) ---
+  public async setClientContentFilter(
+    ipOrMac: string,
+    gameIds: string[],
+    websiteIds: string[],
+    customDomains: string[]
+  ) {
+    const client = this.ensureClientExists(ipOrMac);
+    await this.setClientBlockedGames(client.ip_address, gameIds);
+    await this.setClientBlockedWebsites(client.ip_address, websiteIds, customDomains);
+    return client;
+  }
+
+  public getFilterCatalog() {
+    return {
+      games: POPULAR_GAMES,
+      websites: POPULAR_WEBSITES,
+    };
+  }
+
+  public async setClientAlias(ipOrMac: string, alias: string) {
+    const client = this.ensureClientExists(ipOrMac);
+    client.alias = alias;
+
+    if (!this.persistedClientsState[client.ip_address]) {
+      this.persistedClientsState[client.ip_address] = {};
+    }
+    this.persistedClientsState[client.ip_address].alias = alias;
+    this.savePersistedState();
+
+    if (this.config.host && client.ip_address) {
+      try {
+        const leases = await this.makeRouterOsRequest('/ip/dhcp-server/lease', { timeoutMs: 3000 });
+        if (Array.isArray(leases)) {
+          const match = leases.find((l: any) => (l['active-address'] || l.address) === client.ip_address);
+          if (match && (match['.id'] || match.id)) {
+            await this.makeRouterOsRequest(`/ip/dhcp-server/lease/${match['.id'] || match.id}`, {
+              method: 'PATCH',
+              body: { comment: alias },
+            }).catch(() => {});
+          }
+        }
+      } catch {}
+    }
+
+    return client;
+  }
+
+  // --- Queues Management ---
+
+  public getQueues(): SimpleQueue[] {
+    return this.queues;
+  }
+
+  private queueBody(q: Partial<SimpleQueue>): Record<string, any> {
+    const body: Record<string, any> = {};
+    if (q.name !== undefined) body.name = q.name;
+    if (q.target !== undefined) body.target = q.target;
+    if (q.max_limit_upload && q.max_limit_download) body['max-limit'] = `${q.max_limit_upload}/${q.max_limit_download}`;
+    if (q.priority !== undefined && q.priority !== null) body.priority = `${Number(q.priority)}/${Number(q.priority)}`;
+    if (q.burst_limit_upload && q.burst_limit_download) body['burst-limit'] = `${q.burst_limit_upload}/${q.burst_limit_download}`;
+    if (q.burst_threshold_upload && q.burst_threshold_download) {
+      body['burst-threshold'] = `${q.burst_threshold_upload}/${q.burst_threshold_download}`;
+    }
+    if (q.burst_time) body['burst-time'] = String(q.burst_time).includes('/') ? q.burst_time : `${q.burst_time}/${q.burst_time}`;
+    if (q.disabled !== undefined) body.disabled = Boolean(q.disabled);
+    if (q.comment !== undefined) body.comment = q.comment;
+    return body;
+  }
+
+  public async createQueue(newQueue: Partial<SimpleQueue>): Promise<SimpleQueue> {
+    if (!newQueue.name || !newQueue.target) {
+      throw new Error('Queue name and target IP/subnet are required');
+    }
+
+    const queue: SimpleQueue = {
+      id: `q-${Date.now()}`,
+      name: newQueue.name,
+      target: newQueue.target,
+      max_limit_upload: newQueue.max_limit_upload || '10M',
+      max_limit_download: newQueue.max_limit_download || '25M',
+      burst_limit_upload: newQueue.burst_limit_upload,
+      burst_limit_download: newQueue.burst_limit_download,
+      burst_threshold_upload: newQueue.burst_threshold_upload,
+      burst_threshold_download: newQueue.burst_threshold_download,
+      burst_time: newQueue.burst_time,
+      priority: newQueue.priority || 8,
+      current_rate_upload_bps: 0,
+      current_rate_download_bps: 0,
+      total_bytes_upload: 0,
+      total_bytes_download: 0,
+      packet_drops: 0,
+      disabled: Boolean(newQueue.disabled),
+      dynamic: false,
+      comment: newQueue.comment || 'Created from Home Assistant MikroTik Manager',
+    };
+
+    if (this.config.host) {
+      // Errors propagate to the caller: never report success for something the router rejected
+      const res = await this.makeRouterOsRequest('/queue/simple', { method: 'PUT', body: this.queueBody(queue) });
+      queue.id = idOf(res) || queue.id;
+    }
+
+    this.queues.push(queue);
+    await this.refreshNow();
+    return this.queues.find((q) => q.id === queue.id) || queue;
+  }
+
+  public async updateQueue(id: string, updates: Partial<SimpleQueue>): Promise<SimpleQueue> {
+    const q = this.queues.find((x) => x.id === id);
+    if (!q) throw new Error(`Queue not found: ${id}`);
+
+    if (this.config.host) {
+      const routerId = await this.resolveRouterId('/queue/simple', id, (rq: any) => rq.name === q.name);
+      const body = this.queueBody(updates);
+      if (Object.keys(body).length > 0) {
+        await this.makeRouterOsRequest(`/queue/simple/${routerId}`, { method: 'PATCH', body });
+      }
+    }
+
+    Object.assign(q, updates);
+    await this.refreshNow();
+    return this.queues.find((x) => x.name === q.name || x.id === q.id) || q;
+  }
+
+  public async deleteQueue(id: string) {
+    const idx = this.queues.findIndex((x) => x.id === id);
+    if (idx === -1) throw new Error(`Queue not found: ${id}`);
+    const removed = this.queues[idx];
+
+    if (this.config.host) {
+      const routerId = await this.resolveRouterId('/queue/simple', id, (rq: any) => rq.name === removed.name);
+      await this.deleteRouterItem('/queue/simple', routerId);
+    }
+
+    this.queues.splice(idx, 1);
+    await this.refreshNow();
+    return removed;
+  }
+
+  // --- Schedules Management ---
+
+  public getSchedules(): RouterSchedule[] {
+    return this.schedules;
+  }
+
+  public async createSchedule(newSch: Partial<RouterSchedule>): Promise<RouterSchedule> {
+    if (!newSch.name || !newSch.on_event) {
+      throw new Error('Schedule name and script on_event command are required');
+    }
+
+    const item: RouterSchedule = {
+      id: `sch-${Date.now()}`,
+      name: newSch.name,
+      start_date: newSch.start_date || '2026-01-01',
+      start_time: newSch.start_time || '00:00:00',
+      interval: newSch.interval || '1d',
+      on_event: newSch.on_event,
+      run_count: 0,
+      next_run: `Pending`,
+      disabled: Boolean(newSch.disabled),
+      comment: newSch.comment || 'Custom HA automation schedule',
+    };
+
+    if (this.config.host) {
+      const res = await this.makeRouterOsRequest('/system/scheduler', {
+        method: 'PUT',
+        body: {
+          name: item.name,
+          'start-time': item.start_time,
+          interval: item.interval,
+          'on-event': item.on_event,
+          // Keep the script's policy small: RouterOS only lets a user edit a scheduler whose
+          // policies the user also holds, so the default (all policies) breaks restricted users.
+          policy: 'read,write,policy,test',
+          comment: item.comment,
+          disabled: item.disabled,
+        },
+      });
+      item.id = idOf(res) || res?.ret || item.id;
+    }
+
+    this.schedules.push(item);
+    await this.refreshNow();
+    return this.schedules.find((s) => s.id === item.id) || item;
+  }
+
+  public async updateSchedule(id: string, updates: Partial<RouterSchedule>): Promise<RouterSchedule> {
+    const sch = this.schedules.find((x) => x.id === id);
+    if (!sch) throw new Error(`Schedule not found: ${id}`);
+
+    if (this.config.host) {
+      const routerId = await this.resolveRouterId('/system/scheduler', id, (rs: any) => rs.name === sch.name);
+      const body: Record<string, any> = {};
+      if (updates.name) body.name = updates.name;
+      if (updates.start_time) body['start-time'] = updates.start_time;
+      if (updates.interval) body.interval = updates.interval;
+      if (updates.on_event) body['on-event'] = updates.on_event;
+      if (updates.comment !== undefined) body.comment = updates.comment;
+      if (updates.disabled !== undefined) body.disabled = Boolean(updates.disabled);
+      if (Object.keys(body).length > 0) {
+        await this.makeRouterOsRequest(`/system/scheduler/${routerId}`, { method: 'PATCH', body });
+      }
+    }
+
+    Object.assign(sch, updates);
+    await this.refreshNow();
+    return this.schedules.find((x) => x.id === sch.id || x.name === sch.name) || sch;
+  }
+
+  public async deleteSchedule(id: string) {
+    const idx = this.schedules.findIndex((x) => x.id === id);
+    if (idx === -1) throw new Error(`Schedule not found: ${id}`);
+    const removed = this.schedules[idx];
+
+    if (this.config.host) {
+      const routerId = await this.resolveRouterId('/system/scheduler', id, (rs: any) => rs.name === removed.name);
+      await this.deleteRouterItem('/system/scheduler', routerId);
+    }
+
+    this.schedules.splice(idx, 1);
+    await this.refreshNow();
+    return removed;
+  }
+
+  public async runScheduleNow(id: string) {
+    const sch = this.schedules.find((x) => x.id === id);
+    if (!sch) throw new Error(`Schedule not found: ${id}`);
+
+    if (this.config.host) {
+      const script = String(sch.on_event || '').trim();
+      if (/^[\w.-]+$/.test(script)) {
+        // on-event names a stored script
+        await this.makeRouterOsRequest('/system/script/run', { method: 'POST', body: { number: script } });
+      } else {
+        // on-event holds inline RouterOS commands
+        await this.makeRouterOsRequest('/execute', { method: 'POST', body: { script } });
+      }
+    }
+
+    sch.run_count += 1;
+    sch.next_run = `Triggered just now`;
+    return { success: true, message: `Schedule "${sch.name}" executed on RouterOS.`, sch };
+  }
+
+  // --- Firewall Rules Management ---
+
+  public getFirewallRules() {
+    return {
+      filter: this.firewallRules,
+      address_lists: this.addressLists,
+      nat: this.natRules,
+      killswitch_active: this.panicKillswitchActive,
+    };
+  }
+
+  public async createFirewallFilterRule(newRule: Partial<FirewallFilterRule>): Promise<FirewallFilterRule> {
+    if (!newRule.chain || !newRule.action) {
+      throw new Error('Chain and action are required for firewall filter rule');
+    }
+
+    const rule: FirewallFilterRule = {
+      id: `fw-${Date.now()}`,
+      order: this.firewallRules.length + 1,
+      chain: newRule.chain,
+      action: newRule.action,
+      src_address: newRule.src_address,
+      dst_address: newRule.dst_address,
+      src_address_list: newRule.src_address_list,
+      dst_address_list: newRule.dst_address_list,
+      protocol: newRule.protocol,
+      dst_port: newRule.dst_port,
+      tls_host: newRule.tls_host,
+      in_interface: newRule.in_interface,
+      out_interface: newRule.out_interface,
+      connection_state: newRule.connection_state,
+      packets: 0,
+      bytes: 0,
+      disabled: Boolean(newRule.disabled),
+      comment: newRule.comment || 'Added via HA MikroTik Manager',
+    };
+
+    if (this.config.host) {
+      const body: any = { chain: rule.chain, action: rule.action, disabled: rule.disabled };
+      if (rule.src_address) body['src-address'] = rule.src_address;
+      if (rule.dst_address) body['dst-address'] = rule.dst_address;
+      if (rule.src_address_list) body['src-address-list'] = rule.src_address_list;
+      if (rule.dst_address_list) body['dst-address-list'] = rule.dst_address_list;
+      if (rule.protocol) {
+        body['protocol'] = rule.protocol;
+      } else if (rule.tls_host || rule.dst_port) {
+        body['protocol'] = 'tcp';
+      }
+      if (rule.dst_port) body['dst-port'] = rule.dst_port;
+      if (rule.tls_host) body['tls-host'] = rule.tls_host;
+      if (rule.in_interface) body['in-interface'] = rule.in_interface;
+      if (rule.out_interface) body['out-interface'] = rule.out_interface;
+      if (rule.connection_state) body['connection-state'] = rule.connection_state;
+      if (rule.comment) body['comment'] = rule.comment;
+
+      const created = await this.runWithFirewallLock(() => this.addFirewallFilterRuleToRouter(body));
+      rule.id = idOf(created) || rule.id;
+    }
+
+    this.firewallRules.push(rule);
+    await this.refreshNow();
+    return this.firewallRules.find((r) => r.id === rule.id) || rule;
+  }
+
+  public async updateFirewallFilterRule(id: string, updates: Partial<FirewallFilterRule>) {
+    const r = this.firewallRules.find((x) => x.id === id);
+    if (!r) throw new Error(`Rule not found: ${id}`);
+
+    if (this.config.host) {
+      const routerId = await this.resolveRouterId('/ip/firewall/filter', id, (rr: any) => rr.comment === r.comment);
+      const body: Record<string, any> = {};
+      if (updates.disabled !== undefined) body.disabled = Boolean(updates.disabled);
+      if (updates.comment !== undefined) body.comment = updates.comment;
+      if (updates.action) body.action = updates.action;
+      if (updates.chain) body.chain = updates.chain;
+      if (updates.src_address !== undefined) body['src-address'] = updates.src_address;
+      if (updates.dst_address !== undefined) body['dst-address'] = updates.dst_address;
+      if (updates.src_address_list !== undefined) body['src-address-list'] = updates.src_address_list;
+      if (updates.dst_address_list !== undefined) body['dst-address-list'] = updates.dst_address_list;
+      if (updates.protocol !== undefined) body.protocol = updates.protocol;
+      if (updates.dst_port !== undefined) body['dst-port'] = updates.dst_port;
+      if (updates.tls_host !== undefined) body['tls-host'] = updates.tls_host;
+      if (Object.keys(body).length > 0) {
+        await this.makeRouterOsRequest(`/ip/firewall/filter/${routerId}`, { method: 'PATCH', body });
+      }
+    }
+
+    Object.assign(r, updates);
+    await this.refreshNow();
+    return this.firewallRules.find((x) => x.id === r.id) || r;
+  }
+
+  public async deleteFirewallFilterRule(id: string) {
+    const idx = this.firewallRules.findIndex((x) => x.id === id);
+    if (idx === -1) throw new Error(`Rule not found: ${id}`);
+    const removed = this.firewallRules[idx];
+
+    if (this.config.host) {
+      const routerId = await this.resolveRouterId('/ip/firewall/filter', id, (rr: any) => rr.comment === removed.comment);
+      await this.deleteRouterItem('/ip/firewall/filter', routerId);
+    }
+
+    this.firewallRules.splice(idx, 1);
+    await this.refreshNow();
+    return removed;
+  }
+
+  public async deleteAddressListEntry(id: string) {
+    const idx = this.addressLists.findIndex((x) => x.id === id);
+    if (idx === -1) throw new Error(`Address-list entry not found: ${id}`);
+    const removed = this.addressLists[idx];
+
+    if (this.config.host) {
+      const routerId = await this.resolveRouterId(
+        '/ip/firewall/address-list',
+        id,
+        (a: any) => a.list === removed.list && a.address === removed.address
+      );
+      await this.deleteRouterItem('/ip/firewall/address-list', routerId);
+    }
+
+    this.addressLists.splice(idx, 1);
+    await this.refreshNow();
+    return removed;
+  }
+
+  public async togglePanicKillswitch(active: boolean) {
+    if (this.config.host) {
+      const existingRules = await this.makeRouterOsRequest('/ip/firewall/filter', { timeoutMs: 3500 });
+      const dropRule = Array.isArray(existingRules)
+        ? existingRules.find((r: any) => (r.comment || '').includes('HA Panic Emergency Killswitch'))
+        : null;
+
+      if (active) {
+        if (dropRule) {
+          await this.makeRouterOsRequest(`/ip/firewall/filter/${idOf(dropRule)}`, {
+            method: 'PATCH',
+            body: { disabled: false },
+          });
+        } else {
+          await this.runWithFirewallLock(() =>
+            this.addFirewallFilterRuleToRouter({
+              chain: 'forward',
+              action: 'drop',
+              disabled: false,
+              comment: 'HA Panic Emergency Killswitch: Block all forwarding Internet traffic',
+            })
+          );
+        }
+        // Flush active connections on all clients
+        for (const c of this.clients) {
+          if (c.ip_address) await this.killClientConnections(c.ip_address);
+        }
+      } else if (dropRule) {
+        await this.makeRouterOsRequest(`/ip/firewall/filter/${idOf(dropRule)}`, {
+          method: 'PATCH',
+          body: { disabled: true },
+        });
+      }
+    }
+
+    this.panicKillswitchActive = active;
+    await this.refreshNow();
+
+    return {
+      killswitch_active: this.panicKillswitchActive,
+      message: active
+        ? 'Panic Emergency Cutoff ACTIVATED: All WAN forwarded traffic is blocked!'
+        : 'Panic Emergency Cutoff DEACTIVATED: Normal network forwarding restored.',
+    };
+  }
+
+  // --- Home Assistant Add-on & CasaOS App Manifest & Bundle Exporter ---
+
+  public getHomeAssistantPackage() {
+    const configYaml = `name: "MikroTik Manager"
+description: "Manage MikroTik RouterOS queues, multi-restriction schedules, firewall, popular games & website filtering, and live throughput in Home Assistant."
+version: "1.4.16"
+slug: "mikrotik_manager"
+url: "https://github.com/smarthomekh/hasaddon"
+init: false
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+  - i386
+startup: application
+boot: auto
+panel_icon: "mdi:router-network"
+panel_title: "MikroTik"
+ingress: true
+ingress_port: 3000
+options:
+  router_host: "${this.config.host || '192.168.88.1'}"
+  router_port: ${this.config.port || 8443}
+  router_user: "${this.config.username || 'admin'}"
+  router_password: ""
+  use_ssl: ${this.config.use_ssl}
+  allow_insecure_cert: ${this.config.allow_insecure_cert}
+  poll_interval: 1000
+  demo_mode: false
+schema:
+  router_host: "str"
+  router_port: "int"
+  router_user: "str"
+  router_password: "password"
+  use_ssl: "bool"
+  allow_insecure_cert: "bool"
+  poll_interval: "int?"
+  demo_mode: "bool?"
+`;
+
+    const buildYaml = `build_from:
+  aarch64: "node:20-alpine"
+  amd64: "node:20-alpine"
+  armv7: "node:20-alpine"
+  armhf: "node:20-alpine"
+  i386: "node:20-alpine"
+`;
+
+    const buildJson = `{
+  "build_from": {
+    "aarch64": "node:20-alpine",
+    "amd64": "node:20-alpine",
+    "armv7": "node:20-alpine",
+    "armhf": "node:20-alpine",
+    "i386": "node:20-alpine"
+  }
+}
+`;
+
+    const dockerfile = `ARG BUILD_FROM=node:20-alpine
+FROM \${BUILD_FROM}
+
+ENV LANG=C.UTF-8 \\
+    PORT=3000
+
+# Install Node.js, npm, bash, curl, and jq if not already present
+RUN if ! command -v node >/dev/null 2>&1; then \\
+      apk add --no-cache nodejs npm bash curl jq; \\
+    else \\
+      apk add --no-cache bash curl jq; \\
+    fi
+
+WORKDIR /app
+
+# Copy all repository files (including pre-built dist)
+COPY . .
+
+# Install dependencies:
+# If pre-built dist/ is present, only install lightweight runtime dependencies (fast & zero memory crash).
+# Otherwise compile from source.
+RUN if [ -f "dist/server.js" ] && [ -f "dist/index.html" ]; then \\
+      echo "=== Pre-built dist detected. Installing lightweight runtime dependencies... ===" && \\
+      npm install --omit=dev --no-audit --no-fund; \\
+    else \\
+      echo "=== No pre-built dist found. Compiling from source... ===" && \\
+      npm install --unsafe-perm && \\
+      npm run build && \\
+      npm prune --production; \\
+    fi
+
+# Make startup script executable and fix line endings
+COPY run.sh /run.sh
+RUN sed -i 's/\r$//' /run.sh && chmod +x /run.sh
+
+ENV NODE_ENV=production
+
+EXPOSE 3000
+
+CMD [ "/run.sh" ]
+`;
+
+    const dockerComposeYaml = `name: mikrotik-manager
+
+services:
+  mikrotik-manager:
+    image: ghcr.io/smarthomekh/mikrotik-manager:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mikrotik-manager
+    restart: unless-stopped
+    network_mode: bridge
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - ROUTER_HOST=${this.config.host || '192.168.88.1'}
+      - ROUTER_PORT=${this.config.port || 8443}
+      - ROUTER_USER=${this.config.username || 'admin'}
+      - ROUTER_PASSWORD=${this.config.password || ''}
+      - USE_SSL=${this.config.use_ssl}
+      - ALLOW_INSECURE_CERT=${this.config.allow_insecure_cert}
+      - DEMO_MODE=${this.config.mode === 'demo'}
+    volumes:
+      - /DATA/AppData/mikrotik-manager/data:/data
+    x-casaos:
+      envs:
+        - container: ROUTER_HOST
+          description:
+            en_us: "MikroTik Router IP address (e.g. 192.168.88.1)"
+        - container: ROUTER_PORT
+          description:
+            en_us: "RouterOS REST API port (8443 for HTTPS or 8282/80 for HTTP)"
+        - container: ROUTER_USER
+          description:
+            en_us: "RouterOS admin username"
+        - container: ROUTER_PASSWORD
+          description:
+            en_us: "RouterOS admin password"
+        - container: USE_SSL
+          description:
+            en_us: "Enable SSL HTTPS connection (true/false)"
+        - container: ALLOW_INSECURE_CERT
+          description:
+            en_us: "Accept self-signed router certificate (true/false)"
+        - container: DEMO_MODE
+          description:
+            en_us: "Enable demo simulation mode (false for live router)"
+      ports:
+        - container: "3000"
+          description:
+            en_us: "MikroTik Manager Web Interface Port"
+      volumes:
+        - container: /data
+          description:
+            en_us: "Persistent storage directory for router settings and client rules"
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+    - arm
+  main: mikrotik-manager
+  author: SmartHomeKH
+  category: Network
+  description:
+    en_us: "MikroTik RouterOS Gateway Manager for CasaOS: Live WAN/LAN bandwidth graphs, popular game blocking (Roblox, Minecraft, Fortnite, Free Fire, PUBG), social media & website filtering (TikTok, YouTube, Facebook), multi-time curfew locks, simple queues QoS, and firewall rule management."
+  developer: SmartHomeKH
+  icon: https://raw.githubusercontent.com/smarthomekh/hasaddon/main/icon.png
+  screenshot_link:
+    - https://raw.githubusercontent.com/smarthomekh/hasaddon/main/icon.png
+  tagline:
+    en_us: "MikroTik RouterOS Parental Control, QoS & Firewall Manager"
+  thumbnail: https://raw.githubusercontent.com/smarthomekh/hasaddon/main/icon.png
+  title:
+    en_us: "MikroTik Manager"
+  index: /
+  port_map: "3000"
+  scheme: http
+`;
+
+    const runSh = `#!/usr/bin/env sh
+set -e
+
+echo "[MikroTik Manager] Starting MikroTik Gateway Manager v1.4.16 (Home Assistant & CasaOS)..."
+
+CONFIG_PATH=/data/options.json
+
+if [ -f "$CONFIG_PATH" ]; then
+    echo "[MikroTik Manager] Home Assistant options.json detected at $CONFIG_PATH."
+else
+    echo "[MikroTik Manager] Running in standalone / CasaOS mode."
+fi
+
+export PORT="\${PORT:-3000}"
+export NODE_ENV=production
+
+cd /app
+
+if [ -f "dist/server.js" ]; then
+    echo "[MikroTik Manager] Launching pre-built production server on port \${PORT}..."
+    exec node dist/server.js
+elif [ -f "server.js" ]; then
+    echo "[MikroTik Manager] Launching server.js on port \${PORT}..."
+    exec node server.js
+elif [ -f "server.ts" ]; then
+    echo "[MikroTik Manager] Attempting to run server.ts with tsx on port \${PORT}..."
+    exec npx tsx server.ts
+else
+    echo "================================================================================"
+    echo "[MikroTik Manager] CRITICAL ERROR: No executable entrypoint found in /app!"
+    echo "Expected 'dist/server.js' or 'server.ts'."
+    echo "Please ensure your repository includes the compiled 'dist/' directory."
+    echo "================================================================================"
+    exit 1
+fi
+`;
+
+    const packageJsonContent = `{
+  "name": "mikrotik-manager",
+  "private": true,
+  "version": "1.4.16",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=esm --outfile=dist/server.js --external:express --external:vite --external:dotenv --external:jszip",
+    "start": "node dist/server.js",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "jszip": "^3.10.2"
+  },
+  "devDependencies": {
+    "@google/genai": "^2.4.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/express": "^4.17.21",
+    "@types/jszip": "^3.4.1",
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "autoprefixer": "^10.4.21",
+    "esbuild": "^0.25.0",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.21.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
+  }
+}
+`;
+
+    const haSensorsYaml = `# Add this to your Home Assistant configuration.yaml to extract live MikroTik metrics!
+rest:
+  - resource: http://localhost:3000/api/throughput
+    scan_interval: 2
+    sensor:
+      - name: "MikroTik WAN Download Rate"
+        value_template: "{{ (value_json.wan.rx_bps / 1000000) | round(2) }}"
+        unit_of_measurement: "Mbps"
+        icon: "mdi:download-network"
+      - name: "MikroTik WAN Upload Rate"
+        value_template: "{{ (value_json.wan.tx_bps / 1000000) | round(2) }}"
+        unit_of_measurement: "Mbps"
+        icon: "mdi:upload-network"
+  - resource: http://localhost:3000/api/status
+    scan_interval: 10
+    sensor:
+      - name: "MikroTik CPU Load"
+        value_template: "{{ value_json.info.cpu_load_percent }}"
+        unit_of_measurement: "%"
+        icon: "mdi:cpu-64-bit"
+      - name: "MikroTik Router Uptime"
+        value_template: "{{ value_json.info.uptime }}"
+        icon: "mdi:clock-outline"
+`;
+
+    const haLovelaceCardYaml = `type: vertical-stack
+title: MikroTik RouterOS Gateway
+cards:
+  - type: gauge
+    name: WAN Download Throughput
+    entity: sensor.mikrotik_wan_download_rate
+    min: 0
+    max: 500
+    needle: true
+    severity:
+      green: 0
+      yellow: 350
+      red: 450
+  - type: horizontal-stack
+    cards:
+      - type: entity
+        entity: sensor.mikrotik_wan_upload_rate
+        name: WAN Upload
+      - type: entity
+        entity: sensor.mikrotik_cpu_load
+        name: CPU Load
+  - type: custom:mini-graph-card
+    entities:
+      - entity: sensor.mikrotik_wan_download_rate
+        name: Download (Mbps)
+        color: '#00d26a'
+      - entity: sensor.mikrotik_wan_upload_rate
+        name: Upload (Mbps)
+        color: '#00a3ff'
+    line_width: 2
+    hours_to_show: 1
+    points_per_hour: 60
+`;
+
+    const repositoryYaml = `name: "SmartHomeKH Add-ons"
+url: "https://github.com/smarthomekh/hasaddon"
+maintainer: "SmartHomeKH"
+`;
+
+    const repositoryJson = `{
+  "name": "SmartHomeKH Add-ons",
+  "url": "https://github.com/smarthomekh/hasaddon",
+  "maintainer": "SmartHomeKH"
+}
+`;
+
+    const docsMd = `# MikroTik Manager (CasaOS & Home Assistant)
+
+Directly monitor and govern your MikroTik router inside **CasaOS** or **Home Assistant**:
+- **Popular Game Blocking**: 1-click block for Roblox, Minecraft, Fortnite, Free Fire, PUBG, Steam, and Mobile Legends.
+- **Website & Social Media Filter**: Block TikTok, YouTube, Instagram, Discord, Facebook, Reddit, and custom domains.
+- **Multi-Restriction Time Scheduler**: Configure multiple independent curfew and study windows per device.
+- **Simple Queues**: Set bandwidth caps per client or IP pool.
+- **Firewall Controls**: 1-click device internet cutoff via address-list and filter rules.
+- **Real-Time Throughput**: Live chart and gauges of WAN & LAN throughput.
+- **RouterOS v7 Support**: Works with standard RouterOS REST API on port 8443 (HTTPS) or 8282 (HTTP).
+
+## 1. Quick Install on CasaOS (1-Click)
+1. Open your **CasaOS** web dashboard.
+2. Open the **App Store** and click **Custom Install** (or "+").
+3. Click the **Import** icon in the top right corner of the dialog.
+4. Paste the content of \`docker-compose.yml\` and click **Submit**.
+5. Set your Router IP (\`192.168.88.1\`), Port (\`8443\`), User, and Password.
+6. Click **Install**. You can now launch MikroTik Manager directly from your CasaOS home screen!
+
+## 2. Installation in Home Assistant
+1. In Home Assistant, go to **Settings > Add-ons > Add-on Store**.
+2. Click three dots (top right) > **Repositories** > Add \`https://github.com/smarthomekh/hasaddon\`.
+3. Select **MikroTik Manager** (v1.4.1) and click **Install**.
+4. Set your Router IP, Username, and Password in the **Configuration** tab.
+5. Click **Start** and select **Show in sidebar**!
+`;
+
+    return {
+      'docker-compose.yml': dockerComposeYaml,
+      'config.yaml': configYaml,
+      'build.yaml': buildYaml,
+      'build.json': buildJson,
+      'repository.yaml': repositoryYaml,
+      'repository.json': repositoryJson,
+      Dockerfile: dockerfile,
+      'run.sh': runSh,
+      'package.json': packageJsonContent,
+      'DOCS.md': docsMd,
+      'homeassistant_sensors.yaml': haSensorsYaml,
+      'homeassistant_lovelace_card.yaml': haLovelaceCardYaml,
+    };
+  }
+}
+
+export const mikrotikService = new MikroTikService();
