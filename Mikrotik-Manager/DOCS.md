@@ -1,5 +1,7 @@
 # MikroTik Manager
-
+ <p align="center">
+  <img src="logo.png" alt="MikroTik Manager Logo" width="180">
+</p>
 <p align="center">
   <strong>Smart Home Cambodia – Home Assistant Add-on</strong>
   <br>
