@@ -1,0 +1,34 @@
+name: "MikroTik Manager"
+description: "Manage MikroTik RouterOS queues, multi-restriction schedules, firewall, popular games & website filtering, and live throughput in Home Assistant."
+version: "1.4.16"
+slug: "mikrotik_manager"
+url: "https://github.com/smarthomekh/hasaddon"
+init: false
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+  - i386
+startup: application
+boot: auto
+panel_icon: "mdi:router-network"
+panel_title: "MikroTik"
+ingress: true
+ingress_port: 3000
+options:
+  router_host: "192.168.88.1"
+  router_port: 80
+  router_user: "admin"
+  router_password: ""
+  use_ssl: false
+  allow_insecure_cert: true
+  poll_interval: 1000
+schema:
+  router_host: "str"
+  router_port: "int"
+  router_user: "str"
+  router_password: "password"
+  use_ssl: "bool"
+  allow_insecure_cert: "bool"
+  poll_interval: "int?"
