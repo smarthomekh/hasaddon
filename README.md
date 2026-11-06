@@ -1,6 +1,6 @@
 # Smart Home Cambodia – Home Assistant Add-ons
 <p align="center">
-  <img src="/blob/main/banner.png" alt="Smart Home Cambodia – Home Assistant Add-ons" width="100%">
+  <img src="/banner.png" alt="Smart Home Cambodia – Home Assistant Add-ons" width="100%">
 </p>
 <p align="center">
   <strong>Making Smart Living Smarter with Home Assistant</strong>
